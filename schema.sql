@@ -85,6 +85,7 @@ CREATE TABLE Step (
 COMMENT ON TABLE Step IS 'Defines types or categories of recipe steps (e.g., "Levain," "Bulk Fermentation").';
 COMMENT ON COLUMN Step.step_name IS 'Name of the step (e.g., "Mix Levain," "Bulk Ferment"). This can be more specific than step_type.';
 
+-- ... (other table definitions above) ...
 
 -- 6. RecipeStep Table (Links Recipe to Step, specific instance of a step in a recipe)
 CREATE TABLE RecipeStep (
@@ -96,6 +97,7 @@ CREATE TABLE RecipeStep (
     target_hydration REAL,
     notes TEXT,
     duration_override INTEGER,
+    target_temperature_celsius REAL, -- <<<< ADD THIS LINE HERE
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_recipe_step_order UNIQUE (recipe_id, step_order)
@@ -104,6 +106,10 @@ CREATE TABLE RecipeStep (
 COMMENT ON TABLE RecipeStep IS 'Links a Recipe to a Step, defining a specific instance of a step within a recipe, its order, and stage-specific targets. This effectively represents a "stage" in a recipe.';
 COMMENT ON COLUMN RecipeStep.contribution_pct IS 'Percentage contribution of this step (and its ingredients) to the final dough weight. For starter, this is the starter percentage.';
 COMMENT ON COLUMN RecipeStep.target_hydration IS 'Target hydration for this specific step/stage. For starter, this is its internal hydration.';
+-- You might want to add a comment for target_temperature_celsius as well, e.g.:
+-- COMMENT ON COLUMN RecipeStep.target_temperature_celsius IS 'Target temperature for this specific recipe step, if applicable (e.g., in Celsius).';
+
+
 
 
 -- 7. StageIngredient Table (Details ingredients for a specific RecipeStep)
