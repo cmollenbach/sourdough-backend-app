@@ -132,7 +132,7 @@ async function getLevainBuildStepId(client) {
 
 async function getIngredientIds(client) {
   const flourIngResult = await client.query(
-    "SELECT ingredient_id FROM Ingredient WHERE ingredient_name ILIKE '%flour%';"
+    "SELECT ingredient_id FROM Ingredient WHERE ingredient_name ILIKE '%flour%';" // Keeps it flexible for different flour names
   );
   const waterIngResult = await client.query(
     "SELECT ingredient_id FROM Ingredient WHERE ingredient_name = 'Water';"
@@ -142,6 +142,8 @@ async function getIngredientIds(client) {
   if (waterIngResult.rows.length === 0)
     throw new Error("'Water' not found in Ingredient table.");
   return {
+    // For simplicity, picking the first flour if multiple are found.
+    // You might want more sophisticated logic if users can select specific default flours.
     flourIngredientId: flourIngResult.rows[0].ingredient_id,
     waterIngredientId: waterIngResult.rows[0].ingredient_id,
   };
@@ -154,7 +156,7 @@ app.get("/", (req, res) => {
   res.send("Hello from the Sourdough Backend!");
 });
 
-// === CORRECTED POST /api/recipes - Create a new recipe with steps ===
+// === POST /api/recipes - Create a new recipe with steps ===
 app.post("/api/recipes", authenticateToken, async (req, res) => {
   const dbUserId = req.user.userId;
   const username = req.user.username;
@@ -165,13 +167,12 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
     targetDoughWeight,
     hydrationPercentage,
     saltPercentage,
-    steps,
+    steps, // Expect steps to potentially include stretch_fold_interval_minutes
   } = req.body;
 
   console.log(
     `POST /api/recipes - User [${username}, ID: ${dbUserId}] creating new recipe: "${recipe_name}"`
   );
-  // console.log(`  Received data:`, JSON.stringify(req.body, null, 2)); // Keep for debugging if needed
 
   if (!recipe_name || recipe_name.trim() === "") {
     return res.status(400).json({ message: "Recipe name is required." });
@@ -201,7 +202,7 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
     );
     if (unitResult.rows.length === 0)
       throw new Error("Default unit 'g' (grams) not found in Unit table.");
-    const gramsUnitId = unitResult.rows[0].unit_id; // Still needed for Recipe table
+    const gramsUnitId = unitResult.rows[0].unit_id;
 
     const recipeQuery = `
             INSERT INTO Recipe (
@@ -217,7 +218,7 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
       recipe_name.trim(),
       description || null,
       parseFloat(targetDoughWeight),
-      gramsUnitId, // For Recipe.target_weight_unit_id
+      gramsUnitId,
       parseFloat(hydrationPercentage),
       parseFloat(saltPercentage),
       false,
@@ -239,9 +240,10 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
                 INSERT INTO RecipeStep (
                     recipe_id, step_id, step_order, duration_override, notes, 
                     target_temperature_celsius, contribution_pct, target_hydration, 
+                    stretch_fold_interval_minutes, -- <<< NEW FIELD ADDED HERE
                     created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW()) -- <<< ADJUSTED PARAM COUNT
                 RETURNING recipe_step_id;
             `;
       const recipeStepValues = [
@@ -260,6 +262,9 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
           : null,
         step.target_hydration != null
           ? parseFloat(step.target_hydration)
+          : null,
+        step.stretch_fold_interval_minutes != null // <<< NEW FIELD VALUE
+          ? parseInt(step.stretch_fold_interval_minutes, 10)
           : null,
       ];
       const recipeStepResult = await client.query(
@@ -282,14 +287,13 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
         const waterInStarter = starterWeight - flourInStarter;
 
         console.log(
-          `  Levain Step (ID ${newRecipeStepId}): TDW=${overallTargetDoughWeight}, Contr%=${
+          `   Levain Step (ID ${newRecipeStepId}): TDW=${overallTargetDoughWeight}, Contr%=${
             step.contribution_pct
           }, Hydr%=${step.target_hydration} => SW=${starterWeight.toFixed(
             1
           )}, F=${flourInStarter.toFixed(1)}, W=${waterInStarter.toFixed(1)}`
         );
 
-        // CORRECTED StageIngredient INSERT (removed unit_id)
         const stageIngredientQuery = `
                     INSERT INTO StageIngredient (recipe_step_id, ingredient_id, calculated_weight, is_wet)
                     VALUES ($1, $2, $3, $4);
@@ -311,11 +315,29 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
 
     await client.query("COMMIT");
     console.log(
-      `  Recipe "${newRecipe.recipe_name}" (ID: ${recipeId}) and its steps saved successfully for user ID: ${dbUserId}.`
+      `   Recipe "${newRecipe.recipe_name}" (ID: ${recipeId}) and its steps saved successfully for user ID: ${dbUserId}.`
     );
+    // For consistency, fetch the newly created recipe with all its details to return
+     const finalNewRecipe = await client.query(
+        `SELECT r.*,
+                (SELECT json_agg(rs_agg.*) FROM (
+                    SELECT rs.recipe_step_id, rs.step_id, s.step_name, rs.step_order,
+                           rs.duration_override, rs.notes, rs.target_temperature_celsius,
+                           rs.contribution_pct, rs.target_hydration,
+                           rs.stretch_fold_interval_minutes -- <<< NEW FIELD
+                    FROM RecipeStep rs
+                    JOIN Step s ON rs.step_id = s.step_id
+                    WHERE rs.recipe_id = r.recipe_id
+                    ORDER BY rs.step_order ASC
+                ) AS rs_agg) AS steps
+         FROM Recipe r
+         WHERE r.recipe_id = $1`,
+        [recipeId]
+    );
+
     res.status(201).json({
       message: "Recipe created successfully!",
-      recipe: { ...newRecipe, recipe_id: recipeId, steps: req.body.steps },
+      recipe: finalNewRecipe.rows[0] || { ...newRecipe, recipe_id: recipeId, steps: req.body.steps }, // Fallback just in case
     });
   } catch (error) {
     if (client) await client.query("ROLLBACK");
@@ -330,9 +352,8 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
-// === END OF CORRECTED POST /api/recipes ===
 
-// === CORRECTED PUT /api/recipes/:recipeId - Update an existing recipe and its steps ===
+// === PUT /api/recipes/:recipeId - Update an existing recipe and its steps ===
 app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
   const loggedInUserId = req.user.userId;
   const username = req.user.username;
@@ -344,13 +365,12 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     targetDoughWeight,
     hydrationPercentage,
     saltPercentage,
-    steps,
+    steps, // Expect steps to potentially include stretch_fold_interval_minutes
   } = req.body;
 
   console.log(
     `PUT /api/recipes/${recipeId} - User [${username}, ID: ${loggedInUserId}] attempting to update recipe.`
   );
-  // console.log(`  Update data received:`, JSON.stringify(req.body, null, 2)); // Keep for debugging
 
   if (isNaN(parseInt(recipeId))) {
     return res.status(400).json({ message: "Invalid recipe ID format." });
@@ -361,7 +381,7 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     await client.query("BEGIN");
 
     const ownershipCheckQuery =
-      "SELECT user_id, target_weight FROM Recipe WHERE recipe_id = $1;"; // Also fetch target_weight
+      "SELECT user_id, target_weight FROM Recipe WHERE recipe_id = $1;";
     const ownershipResult = await client.query(ownershipCheckQuery, [recipeId]);
 
     if (ownershipResult.rows.length === 0) {
@@ -391,7 +411,7 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     if (targetDoughWeight !== undefined) {
       recipeUpdateFields.push(`target_weight = $${recipeParamCount++}`);
       recipeUpdateValues.push(parseFloat(targetDoughWeight));
-      currentRecipeTDW = parseFloat(targetDoughWeight); // Update for subsequent StageIngredient calc
+      currentRecipeTDW = parseFloat(targetDoughWeight);
     }
     if (hydrationPercentage !== undefined) {
       recipeUpdateFields.push(`target_hydration = $${recipeParamCount++}`);
@@ -420,21 +440,20 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
           "Failed to update recipe main details or recipe not found for user."
         );
       }
-      console.log(`  Recipe table updated for recipe ID: ${recipeId}`);
+      console.log(`   Recipe table updated for recipe ID: ${recipeId}`);
     }
 
     if (steps && Array.isArray(steps)) {
-      console.log(`  Replacing steps for recipe ID: ${recipeId}`);
+      console.log(`   Replacing steps for recipe ID: ${recipeId}`);
       await client.query("DELETE FROM RecipeStep WHERE recipe_id = $1", [
         recipeId,
       ]);
-      console.log(`  Old RecipeSteps deleted for recipe ID: ${recipeId}`);
+      console.log(`   Old RecipeSteps deleted for recipe ID: ${recipeId}`);
 
       const LEVAIN_BUILD_STEP_ID = await getLevainBuildStepId(client);
       const { flourIngredientId, waterIngredientId } = await getIngredientIds(
         client
       );
-      // unit_id is not needed for StageIngredient inserts
 
       for (const step of steps) {
         if (step.step_id == null || step.step_order == null) {
@@ -443,10 +462,11 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
         const recipeStepQuery = `
                     INSERT INTO RecipeStep (
                         recipe_id, step_id, step_order, duration_override, notes, 
-                        target_temperature_celsius, contribution_pct, target_hydration, 
+                        target_temperature_celsius, contribution_pct, target_hydration,
+                        stretch_fold_interval_minutes, -- <<< NEW FIELD ADDED HERE
                         created_at, updated_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW()) -- <<< ADJUSTED PARAM COUNT
                     RETURNING recipe_step_id;
                 `;
         const recipeStepValues = [
@@ -466,6 +486,9 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
           step.target_hydration != null
             ? parseFloat(step.target_hydration)
             : null,
+          step.stretch_fold_interval_minutes != null // <<< NEW FIELD VALUE
+            ? parseInt(step.stretch_fold_interval_minutes, 10)
+            : null,
         ];
         const recipeStepResult = await client.query(
           recipeStepQuery,
@@ -482,7 +505,7 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
           const stepContributionPct = parseFloat(step.contribution_pct) / 100;
           const stepTargetHydration = parseFloat(step.target_hydration) / 100;
 
-          const starterWeight = currentRecipeTDW * stepContributionPct; // Use potentially updated TDW
+          const starterWeight = currentRecipeTDW * stepContributionPct;
           const flourInStarter = starterWeight / (1 + stepTargetHydration);
           const waterInStarter = starterWeight - flourInStarter;
 
@@ -494,7 +517,6 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
             )}, F=${flourInStarter.toFixed(1)}, W=${waterInStarter.toFixed(1)}`
           );
 
-          // CORRECTED StageIngredient INSERT (removed unit_id)
           const stageIngredientQuery = `
                         INSERT INTO StageIngredient (recipe_step_id, ingredient_id, calculated_weight, is_wet)
                         VALUES ($1, $2, $3, $4);
@@ -517,17 +539,35 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
 
     await client.query("COMMIT");
 
-    const finalRecipeResult = await client.query(
-      "SELECT * FROM Recipe WHERE recipe_id = $1",
-      [recipeId]
-    );
+    // Fetch the complete updated recipe to return
+    const finalRecipeQuery = `
+        SELECT
+            r.recipe_id, r.recipe_name, r.description,
+            r.target_weight AS "targetDoughWeight", -- Alias for consistency
+            r.target_hydration AS "hydrationPercentage",
+            r.target_salt_pct AS "saltPercentage",
+            r.created_at, r.updated_at,
+            (SELECT json_agg(rs_agg.* ORDER BY rs_agg.step_order ASC) FROM (
+                SELECT rs.recipe_step_id, rs.step_id, s.step_name, rs.step_order, 
+                       rs.duration_override, rs.notes, rs.target_temperature_celsius,
+                       rs.contribution_pct, rs.target_hydration,
+                       rs.stretch_fold_interval_minutes -- <<< NEW FIELD
+                FROM RecipeStep rs
+                JOIN Step s ON rs.step_id = s.step_id
+                WHERE rs.recipe_id = r.recipe_id
+            ) AS rs_agg) AS steps
+        FROM Recipe r
+        WHERE r.recipe_id = $1 AND r.user_id = $2;
+    `;
+    const finalRecipeResult = await client.query(finalRecipeQuery, [recipeId, loggedInUserId]);
+
 
     console.log(
-      `  Recipe ID ${recipeId} updated successfully for user ID ${loggedInUserId}.`
+      `   Recipe ID ${recipeId} updated successfully for user ID ${loggedInUserId}.`
     );
     res.status(200).json({
       message: "Recipe updated successfully!",
-      recipe: finalRecipeResult.rows[0],
+      recipe: finalRecipeResult.rows[0], // Send the fully formed recipe object
     });
   } catch (error) {
     if (client) await client.query("ROLLBACK");
@@ -542,15 +582,9 @@ app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
-// In sourdough-backend/server.js
 
-// ... (after your other route definitions, e.g., before app.listen)
-
-// === NEW ROUTE: GET /api/steps - Fetch all predefined step types ===
+// GET /api/steps - Fetch all predefined step types
 app.get('/api/steps', authenticateToken, async (req, res) => {
-    // authenticateToken might not be strictly necessary if these steps are considered public,
-    // but it's good practice if only logged-in users should see them or if you plan to expand this.
-    // If they are public, you can remove `authenticateToken`.
     console.log(`GET /api/steps - Fetching all predefined step types.`); 
     try {
         const query = `
@@ -558,29 +592,23 @@ app.get('/api/steps', authenticateToken, async (req, res) => {
                 step_id, 
                 step_name, 
                 description, 
-                step_type,      -- Added from your schema
-                duration_minutes AS "defaultDurationMinutes" -- Added from your schema, aliased
-                -- is_predefined -- You might want to send this too
+                step_type,
+                duration_minutes AS "defaultDurationMinutes"
+                -- is_predefined -- Can be added if needed by frontend
             FROM Step 
-            WHERE is_predefined = TRUE  -- Assuming you only want predefined steps for selection
+            WHERE is_predefined = TRUE
             ORDER BY step_id ASC; 
         `;
         
         const { rows } = await pool.query(query);
-        console.log(`  Found ${rows.length} predefined steps.`);
+        console.log(`   Found ${rows.length} predefined steps.`);
         res.json(rows);
     } catch (error) {
         console.error(`🔴 Error in GET /api/steps:`, error.stack);
         res.status(500).json({ message: 'Failed to fetch predefined steps due to server error.' });
     }
 });
-// === END OF NEW ROUTE ===
 
-
-// Start server (this should be at the very end)
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Sourdough backend server listening on host 0.0.0.0, port ${port}`);
-});
 // GET /api/recipes - Fetch all recipes for the authenticated user
 app.get("/api/recipes", authenticateToken, async (req, res) => {
   const loggedInUserId = req.user.userId;
@@ -591,6 +619,9 @@ app.get("/api/recipes", authenticateToken, async (req, res) => {
   );
 
   try {
+    // Query to fetch recipes and include basic levain details if present
+    // Note: This query simplifies by just grabbing the first Levain Build step's details.
+    // A more complex recipe might have multiple levain builds or none.
     const query = `
     SELECT
         r.recipe_id,
@@ -603,19 +634,16 @@ app.get("/api/recipes", authenticateToken, async (req, res) => {
         r.is_base_recipe,
         r.created_at,
         r.updated_at,
-        levain_details.contribution_pct AS "starterPercentage",
-        levain_details.target_hydration AS "starterHydration"
+        (SELECT rs.contribution_pct 
+           FROM RecipeStep rs JOIN Step s ON rs.step_id = s.step_id 
+           WHERE rs.recipe_id = r.recipe_id AND s.step_name = 'Levain Build' 
+           ORDER BY rs.step_order ASC LIMIT 1) AS "starterPercentage",
+        (SELECT rs.target_hydration 
+           FROM RecipeStep rs JOIN Step s ON rs.step_id = s.step_id 
+           WHERE rs.recipe_id = r.recipe_id AND s.step_name = 'Levain Build' 
+           ORDER BY rs.step_order ASC LIMIT 1) AS "starterHydration"
     FROM
         Recipe r
-    LEFT JOIN (
-        SELECT 
-            rs.recipe_id, 
-            rs.contribution_pct, 
-            rs.target_hydration
-        FROM RecipeStep rs
-        JOIN Step s ON rs.step_id = s.step_id
-        WHERE s.step_name = 'Levain Build'
-    ) AS levain_details ON r.recipe_id = levain_details.recipe_id
     WHERE
         r.user_id = $1
     ORDER BY
@@ -627,7 +655,7 @@ app.get("/api/recipes", authenticateToken, async (req, res) => {
       recipe_id: recipe.recipe_id,
       recipe_name: recipe.recipe_name,
       description: recipe.description,
-      targetDoughWeight: String(recipe.target_weight),
+      targetDoughWeight: String(recipe.target_weight), // Frontend expects strings
       hydrationPercentage: String(recipe.hydrationPercentage),
       saltPercentage: String(recipe.saltPercentage),
       starterPercentage:
@@ -643,7 +671,7 @@ app.get("/api/recipes", authenticateToken, async (req, res) => {
     }));
 
     console.log(
-      `  Found ${recipesResponse.length} recipes for user ID: ${loggedInUserId}`
+      `   Found ${recipesResponse.length} recipes for user ID: ${loggedInUserId}`
     );
     res.json(recipesResponse);
   } catch (error) {
@@ -657,7 +685,7 @@ app.get("/api/recipes", authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/recipes/:recipeId - Fetch a specific recipe by its ID
+// GET /api/recipes/:recipeId - Fetch a specific recipe by its ID including its steps
 app.get("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
   const loggedInUserId = req.user.userId;
   const username = req.user.username;
@@ -671,8 +699,10 @@ app.get("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     return res.status(400).json({ message: "Invalid recipe ID format." });
   }
 
-  const client = await pool.connect();
+  // A single client for the transaction
+  const client = await pool.connect(); 
   try {
+    // Fetch main recipe data
     const recipeQuery = `
             SELECT
                 r.recipe_id, r.recipe_name, r.description,
@@ -693,11 +723,13 @@ app.get("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     }
     const recipeData = recipeResult.rows[0];
 
+    // Fetch associated steps
     const stepsQuery = `
             SELECT 
                 rs.recipe_step_id, rs.step_id, s.step_name, rs.step_order, 
                 rs.duration_override, rs.notes, rs.target_temperature_celsius,
-                rs.contribution_pct, rs.target_hydration
+                rs.contribution_pct, rs.target_hydration,
+                rs.stretch_fold_interval_minutes -- <<< NEW FIELD ADDED HERE
             FROM RecipeStep rs
             JOIN Step s ON rs.step_id = s.step_id
             WHERE rs.recipe_id = $1
@@ -705,11 +737,12 @@ app.get("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
         `;
     const stepsResult = await client.query(stepsQuery, [recipeId]);
 
+    // Construct the response
     const recipeResponse = {
       recipe_id: recipeData.recipe_id,
       recipe_name: recipeData.recipe_name,
       description: recipeData.description,
-      targetDoughWeight: String(recipeData.target_weight),
+      targetDoughWeight: String(recipeData.target_weight), // Ensure string for frontend
       hydrationPercentage: String(recipeData.hydrationPercentage),
       saltPercentage: String(recipeData.saltPercentage),
       created_at: recipeData.created_at,
@@ -724,11 +757,12 @@ app.get("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
         target_temperature_celsius: step.target_temperature_celsius,
         contribution_pct: step.contribution_pct,
         target_hydration: step.target_hydration,
+        stretch_fold_interval_minutes: step.stretch_fold_interval_minutes, // <<< NEW FIELD
       })),
     };
 
     console.log(
-      `  Successfully fetched recipe ID ${recipeId} for user ID ${loggedInUserId}.`
+      `   Successfully fetched recipe ID ${recipeId} for user ID ${loggedInUserId}.`
     );
     res.json(recipeResponse);
   } catch (error) {
@@ -740,11 +774,11 @@ app.get("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
       .status(500)
       .json({ message: "Failed to fetch recipe due to server error." });
   } finally {
-    if (client) client.release();
+    if (client) client.release(); // Release client in finally block
   }
 });
 
-// DELETE /api/recipes/:recipeId - Delete a specific recipe for the authenticated user
+// DELETE /api/recipes/:recipeId - Delete a specific recipe
 app.delete("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
   const loggedInUserId = req.user.userId;
   const username = req.user.username;
@@ -778,6 +812,7 @@ app.delete("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
         .json({ message: "You are not authorized to delete this recipe." });
     }
 
+    // Deleting from Recipe will cascade to RecipeStep and StageIngredient due to ON DELETE CASCADE
     const deleteRecipeQuery =
       "DELETE FROM Recipe WHERE recipe_id = $1 AND user_id = $2 RETURNING recipe_name;";
     const deleteResult = await client.query(deleteRecipeQuery, [
@@ -786,6 +821,7 @@ app.delete("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
     ]);
 
     if (deleteResult.rowCount === 0) {
+      // Should not happen if ownership check passed, but good for robustness
       await client.query("ROLLBACK");
       return res
         .status(404)
@@ -796,7 +832,7 @@ app.delete("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
 
     const deletedRecipeName = deleteResult.rows[0].recipe_name;
     console.log(
-      `  Recipe "${deletedRecipeName}" (ID: ${recipeId}) deleted successfully for user ID ${loggedInUserId}.`
+      `   Recipe "${deletedRecipeName}" (ID: ${recipeId}) deleted successfully for user ID ${loggedInUserId}.`
     );
     res
       .status(200)
@@ -818,7 +854,7 @@ app.delete("/api/recipes/:recipeId", authenticateToken, async (req, res) => {
 // --- Auth Routes ---
 app.post("/auth/register", async (req, res) => {
   const { email, password } = req.body;
-  const username = email;
+  const username = email; // Using email as username for simplicity
 
   console.log(`POST /auth/register - Attempting to register: ${username}`);
   if (!email || !password) {
@@ -826,13 +862,21 @@ app.post("/auth/register", async (req, res) => {
       .status(400)
       .json({ message: "Email and password are required." });
   }
+  // Basic email validation (can be more sophisticated)
+  if (!email.includes('@')) {
+    return res.status(400).json({ message: "Invalid email format." });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ message: "Password must be at least 8 characters."})
+  }
+
 
   try {
     const userExistsQuery =
       'SELECT * FROM "User" WHERE username = $1 OR email = $2';
     const existingUser = await pool.query(userExistsQuery, [username, email]);
     if (existingUser.rows.length > 0) {
-      console.log(`  Registration failed: User already exists - ${username}`);
+      console.log(`   Registration failed: User already exists - ${username}`);
       return res
         .status(409)
         .json({ message: "User already exists with this email." });
@@ -840,7 +884,7 @@ app.post("/auth/register", async (req, res) => {
 
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
-    console.log(`  Password hashed for: ${username}`);
+    console.log(`   Password hashed for: ${username}`);
 
     const insertUserQuery = `
       INSERT INTO "User" (username, email, password_hash, auth_provider)
@@ -851,14 +895,14 @@ app.post("/auth/register", async (req, res) => {
       username,
       email,
       passwordHash,
-      "email",
+      "email", // Indicating email/password authentication
     ]);
     const newUser = newUserResult.rows[0];
 
-    console.log(`  User registered: ${JSON.stringify(newUser)}`);
+    console.log(`   User registered: ${JSON.stringify(newUser)}`);
     res.status(201).json({
       message: "User registered successfully!",
-      user: {
+      user: { // Return a subset of user info, excluding password_hash
         userId: newUser.user_id,
         username: newUser.username,
         email: newUser.email,
@@ -873,7 +917,7 @@ app.post("/auth/register", async (req, res) => {
 
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body;
-  const username = email;
+  const username = email; // Assuming username is the email for login
 
   console.log(`POST /auth/login - Attempting login: ${username}`);
   if (!email || !password) {
@@ -884,37 +928,44 @@ app.post("/auth/login", async (req, res) => {
 
   try {
     const findUserQuery =
-      'SELECT * FROM "User" WHERE username = $1 AND auth_provider = $2';
+      'SELECT * FROM "User" WHERE username = $1 AND auth_provider = $2'; // Ensure it's an email provider user
     const userResult = await pool.query(findUserQuery, [username, "email"]);
+
     if (userResult.rows.length === 0) {
-      console.log(`  Login failed: User not found - ${username}`);
+      console.log(`   Login failed: User not found - ${username}`);
       return res.status(401).json({ message: "Invalid credentials." });
     }
     const user = userResult.rows[0];
 
+    // Check if password_hash exists (it might not for OAuth users, though we filter by auth_provider)
+    if (!user.password_hash) {
+        console.log(`   Login failed: User ${username} has no password set (possibly OAuth user).`);
+        return res.status(401).json({ message: "Invalid credentials." });
+    }
+
     const isPasswordMatch = await bcrypt.compare(password, user.password_hash);
     if (!isPasswordMatch) {
-      console.log(`  Login failed: Password incorrect for user - ${username}`);
+      console.log(`   Login failed: Password incorrect for user - ${username}`);
       return res.status(401).json({ message: "Invalid credentials." });
     }
 
-    const expiresIn = "1h";
+    const expiresIn = "1h"; // Token expiration time
     const token = jwt.sign(
-      { userId: user.user_id, username: user.username },
+      { userId: user.user_id, username: user.username }, // Payload
       JWT_SECRET,
       { expiresIn }
     );
 
-    console.log(`  Login successful, token generated for: ${username}`);
+    console.log(`   Login successful, token generated for: ${username}`);
     res.status(200).json({
       message: "Login successful!",
       token,
-      user: {
+      user: { // Return necessary user info to the client
         userId: user.user_id,
         username: user.username,
-        email: user.email,
+        email: user.email
       },
-      expiresIn,
+      expiresIn, // It can be useful for the client to know
     });
   } catch (error) {
     console.error("🔴 Error in POST /auth/login:", error.stack);
@@ -922,8 +973,16 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+
+// Global error handler for routes (must be defined after all routes)
+app.use((err, req, res, next) => {
+  console.error("🔴 GLOBAL ROUTE ERROR HANDLER:", err.stack);
+  res.status(500).send("Something broke!");
+});
+
 // Start server
 app.listen(port, "0.0.0.0", () => {
+  // Listen on all available network interfaces
   console.log(
     `Sourdough backend server listening on host 0.0.0.0, port ${port}`
   );

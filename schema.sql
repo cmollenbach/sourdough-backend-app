@@ -60,15 +60,12 @@ CREATE TABLE Recipe (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_user_recipe_name UNIQUE (user_id, recipe_name) -- User cannot have multiple recipes with the same name
-    -- Partial unique constraint for base recipes will be added separately
 );
 
 COMMENT ON TABLE Recipe IS 'Stores overall information and targets for each recipe.';
 COMMENT ON COLUMN Recipe.user_id IS 'ID of the user who created the recipe. NULL for base recipes.';
 
--- Add partial unique index for base recipes separately
 CREATE UNIQUE INDEX idx_uq_base_recipe_name ON Recipe (recipe_name) WHERE (user_id IS NULL);
-
 
 -- 5. Step Table (Defines types of recipe steps)
 CREATE TABLE Step (
@@ -84,8 +81,7 @@ CREATE TABLE Step (
 
 COMMENT ON TABLE Step IS 'Defines types or categories of recipe steps (e.g., "Levain," "Bulk Fermentation").';
 COMMENT ON COLUMN Step.step_name IS 'Name of the step (e.g., "Mix Levain," "Bulk Ferment"). This can be more specific than step_type.';
-
--- ... (other table definitions above) ...
+COMMENT ON COLUMN Step.duration_minutes IS 'Default or typical duration for this type of step, in minutes.';
 
 -- 6. RecipeStep Table (Links Recipe to Step, specific instance of a step in a recipe)
 CREATE TABLE RecipeStep (
@@ -96,8 +92,9 @@ CREATE TABLE RecipeStep (
     contribution_pct REAL,
     target_hydration REAL,
     notes TEXT,
-    duration_override INTEGER,
-    target_temperature_celsius REAL, -- <<<< ADD THIS LINE HERE
+    duration_override INTEGER, -- For most steps, this is the total duration. For "Bulk Fermentation S&F", this IS the total bulk time.
+    target_temperature_celsius REAL,
+    stretch_fold_interval_minutes INTEGER, -- <<< NEW FIELD
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_recipe_step_order UNIQUE (recipe_id, step_order)
@@ -106,11 +103,9 @@ CREATE TABLE RecipeStep (
 COMMENT ON TABLE RecipeStep IS 'Links a Recipe to a Step, defining a specific instance of a step within a recipe, its order, and stage-specific targets. This effectively represents a "stage" in a recipe.';
 COMMENT ON COLUMN RecipeStep.contribution_pct IS 'Percentage contribution of this step (and its ingredients) to the final dough weight. For starter, this is the starter percentage.';
 COMMENT ON COLUMN RecipeStep.target_hydration IS 'Target hydration for this specific step/stage. For starter, this is its internal hydration.';
--- You might want to add a comment for target_temperature_celsius as well, e.g.:
--- COMMENT ON COLUMN RecipeStep.target_temperature_celsius IS 'Target temperature for this specific recipe step, if applicable (e.g., in Celsius).';
-
-
-
+COMMENT ON COLUMN RecipeStep.duration_override IS 'User-defined duration for this specific recipe step, in minutes. For "Bulk Fermentation with S&F", this represents the total bulk fermentation time.';
+COMMENT ON COLUMN RecipeStep.target_temperature_celsius IS 'Target temperature for this specific recipe step, if applicable (e.g., in Celsius).';
+COMMENT ON COLUMN RecipeStep.stretch_fold_interval_minutes IS 'Interval in minutes for performing stretch and folds during bulk fermentation, if applicable to the step type.';
 
 -- 7. StageIngredient Table (Details ingredients for a specific RecipeStep)
 CREATE TABLE StageIngredient (
@@ -151,13 +146,14 @@ INSERT INTO Ingredient (ingredient_name) VALUES
 ('Active Sourdough Starter');
 
 -- Predefined Steps
-INSERT INTO Step (step_name, step_type, description, is_predefined) VALUES
-('Levain Build', 'Levain', 'Build and ferment the levain (sourdough starter pre-ferment).', TRUE),
-('Autolyse', 'Mixing', 'Resting flour and water before adding other ingredients.', TRUE),
-('Mix Final Dough', 'Mixing', 'Combine all ingredients for the final dough.', TRUE),
-('Bulk Fermentation', 'Fermentation', 'First rise of the dough, often with folds.', TRUE),
-('Shaping', 'Shaping', 'Shape the dough into its final form.', TRUE),
-('Proofing', 'Fermentation', 'Final rise of the shaped dough (can be at room temp or cold).', TRUE),
-('Baking', 'Baking', 'Bake the bread.', TRUE);
+INSERT INTO Step (step_name, step_type, description, is_predefined, duration_minutes) VALUES
+('Levain Build', 'Levain', 'Build and ferment the levain (sourdough starter pre-ferment).', TRUE, NULL), -- Levain duration is highly variable
+('Autolyse', 'Mixing', 'Resting flour and water before adding other ingredients.', TRUE, 30),
+('Mix Final Dough', 'Mixing', 'Combine all ingredients for the final dough.', TRUE, 15),
+('Bulk Fermentation', 'Fermentation', 'First rise of the dough, often with folds.', TRUE, 240),
+('Bulk Fermentation with Stretch and Fold', 'Fermentation', 'Main fermentation period with periodic stretch and folds.', TRUE, 240), -- <<< NEW STEP TYPE
+('Shaping', 'Shaping', 'Shape the dough into its final form.', TRUE, 15),
+('Proofing', 'Fermentation', 'Final rise of the shaped dough (can be at room temp or cold).', TRUE, 120), -- Example, can be much longer if cold
+('Baking', 'Baking', 'Bake the bread.', TRUE, 45);
 
 SELECT 'Database schema created and initial data populated successfully!' AS status;
