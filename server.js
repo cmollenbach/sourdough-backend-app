@@ -352,6 +352,102 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
     if (client) client.release();
   }
 });
+// In your server.js, before app.listen() and error handlers
+
+app.get('/api/templates', authenticateToken, async (req, res) => {
+    console.log(`GET /api/templates - Fetching all base recipe templates.`);
+    try {
+        const query = `
+            SELECT
+                r.recipe_id,
+                r.recipe_name,
+                r.description,
+                r.target_weight,
+                r.target_weight_unit_id,
+                r.target_hydration AS "hydrationPercentage",
+                r.target_salt_pct AS "saltPercentage",
+                r.is_base_recipe,
+                r.created_at,
+                r.updated_at,
+                (SELECT json_agg(rs_agg.* ORDER BY rs_agg.step_order ASC) 
+                 FROM (
+                    SELECT 
+                        rs.recipe_step_id, 
+                        rs.step_id, 
+                        s.step_name, 
+                        s.step_type,
+                        s.description AS step_description,
+                        s.duration_minutes AS step_default_duration_minutes,
+                        rs.step_order, 
+                        rs.duration_override, 
+                        rs.notes, 
+                        rs.target_temperature_celsius,
+                        rs.contribution_pct, 
+                        rs.target_hydration,
+                        rs.stretch_fold_interval_minutes,
+                        (SELECT json_agg(si_agg.* ORDER BY si_agg.ingredient_id ASC)
+                         FROM (
+                            SELECT 
+                                si.ingredient_id,
+                                i.ingredient_name,
+                                si.bakers_percentage,
+                                si.is_wet
+                            FROM StageIngredient si
+                            JOIN Ingredient i ON si.ingredient_id = i.ingredient_id
+                            WHERE si.recipe_step_id = rs.recipe_step_id
+                         ) AS si_agg
+                        ) AS ingredients_in_step
+                    FROM RecipeStep rs
+                    JOIN Step s ON rs.step_id = s.step_id
+                    WHERE rs.recipe_id = r.recipe_id
+                 ) AS rs_agg
+                ) AS steps
+            FROM
+                Recipe r
+            WHERE
+                r.is_base_recipe = TRUE AND r.user_id IS NULL
+            ORDER BY
+                r.recipe_name ASC; 
+        `; // Added more details to the steps subquery
+        
+        const { rows } = await pool.query(query);
+        
+        // Transform to match expected frontend structure if necessary, like your existing /api/recipes/:recipeId
+        const templatesResponse = rows.map(recipe => ({
+            recipe_id: recipe.recipe_id,
+            recipe_name: recipe.recipe_name,
+            description: recipe.description,
+            targetDoughWeight: String(recipe.target_weight),
+            hydrationPercentage: String(recipe.hydrationPercentage),
+            saltPercentage: String(recipe.saltPercentage),
+            is_base_recipe: recipe.is_base_recipe,
+            created_at: recipe.created_at,
+            updated_at: recipe.updated_at,
+            steps: recipe.steps ? recipe.steps.map(step => ({ // ensure steps is not null
+                recipe_step_id: step.recipe_step_id,
+                step_id: step.step_id,
+                step_name: step.step_name,
+                step_type: step.step_type,
+                step_description: step.step_description,
+                step_default_duration_minutes: step.step_default_duration_minutes,
+                step_order: step.step_order,
+                duration_override: step.duration_override,
+                notes: step.notes,
+                target_temperature_celsius: step.target_temperature_celsius,
+                contribution_pct: step.contribution_pct,
+                target_hydration: step.target_hydration,
+                stretch_fold_interval_minutes: step.stretch_fold_interval_minutes,
+                ingredients_in_step: step.ingredients_in_step || [] // Ensure ingredients_in_step is not null
+            })) : [] // if recipe.steps is null, provide empty array
+        }));
+
+        console.log(`   Found ${templatesResponse.length} base recipe templates.`);
+        res.json(templatesResponse);
+    } catch (error) {
+        console.error(`🔴 Error in GET /api/templates:`, error.stack);
+        res.status(500).json({ message: 'Failed to fetch base recipe templates due to server error.' });
+    }
+});
 
 // === PUT /api/recipes/:recipeId - Update an existing recipe and its steps ===
 app.put("/api/recipes/:recipeId", authenticateToken, async (req, res) => {

@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../sourdough-web-calculator"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"openhab.useRestApi": false
+	}
+}
