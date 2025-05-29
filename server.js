@@ -354,7 +354,7 @@ app.post("/api/recipes", authenticateToken, async (req, res) => {
 });
 // In your server.js, before app.listen() and error handlers
 
-app.get('/api/templates', authenticateToken, async (req, res) => {
+app.get('/api/templates',  async (req, res) => {
     console.log(`GET /api/templates - Fetching all base recipe templates.`);
     try {
         const query = `
