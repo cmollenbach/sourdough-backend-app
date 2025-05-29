@@ -26,7 +26,7 @@ INSERT INTO Recipe (user_id, recipe_name, description, target_weight, target_wei
 -- ... (RecipeSteps for Recipe 1 remain the same, including levain target_hydration as 100) ...
 -- ... (StageIngredients for Recipe 1 remain the same, salt bakers_percentage is 0.02) ...
 INSERT INTO RecipeStep (recipe_id, step_id, step_order, contribution_pct, target_hydration, notes, duration_override, target_temperature_celsius, stretch_fold_interval_minutes) VALUES
-((SELECT recipe_id FROM Recipe WHERE recipe_name = 'My First Loaf Tin Sourdough' AND user_id IS NULL), 1, 1, 0.20, 100, 'Build your levain. It should be active and bubbly.', 360, 24, NULL),
+((SELECT recipe_id FROM Recipe WHERE recipe_name = 'My First Loaf Tin Sourdough' AND user_id IS NULL), 1, 1, 20, 100, 'Build your levain. It should be active and bubbly.', 360, 24, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'My First Loaf Tin Sourdough' AND user_id IS NULL), 3, 2, NULL, NULL, 'Combine levain, flour, water, and salt. Mix until no dry bits remain, then rest.', 20, NULL, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'My First Loaf Tin Sourdough' AND user_id IS NULL), 4, 3, NULL, NULL, 'Let dough rise. Perform 2-3 sets of gentle folds if comfortable, spread 30-45 mins apart.', 240, 24, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'My First Loaf Tin Sourdough' AND user_id IS NULL), 7, 4, NULL, NULL, 'Gently shape and place in a loaf tin. Proof at room temperature.', 120, 24, NULL),
@@ -53,7 +53,7 @@ INSERT INTO Recipe (user_id, recipe_name, description, target_weight, target_wei
 -- ... (RecipeSteps for Recipe 2 remain the same, including levain target_hydration as 100) ...
 -- ... (StageIngredients for Recipe 2 remain the same, salt bakers_percentage is 0.025) ...
 INSERT INTO RecipeStep (recipe_id, step_id, step_order, contribution_pct, target_hydration, notes, duration_override, target_temperature_celsius, stretch_fold_interval_minutes) VALUES
-((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Simple Sourdough Focaccia' AND user_id IS NULL), 1, 1, 0.15, 100, 'Build your levain.', 360, 24, NULL),
+((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Simple Sourdough Focaccia' AND user_id IS NULL), 1, 1, 15, 100, 'Build your levain.', 360, 24, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Simple Sourdough Focaccia' AND user_id IS NULL), 3, 2, NULL, NULL, 'Gently mix all ingredients. Dough will be very wet. Add olive oil during mixing if desired (not included in core percentages).', 15, NULL, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Simple Sourdough Focaccia' AND user_id IS NULL), 5, 3, NULL, NULL, 'Perform 3-4 sets of stretch and folds in the bowl.', 180, 24, 30),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Simple Sourdough Focaccia' AND user_id IS NULL), 7, 4, NULL, NULL, 'Transfer to an oiled pan, gently stretch. Dimple generously with oiled fingers and add toppings if desired. Let proof.', 60, 24, NULL),
@@ -80,7 +80,7 @@ INSERT INTO Recipe (user_id, recipe_name, description, target_weight, target_wei
 -- ... (RecipeSteps for Recipe 3 remain the same, including levain target_hydration as 100) ...
 -- ... (StageIngredients for Recipe 3 remain the same, salt bakers_percentage is 0.02) ...
 INSERT INTO RecipeStep (recipe_id, step_id, step_order, contribution_pct, target_hydration, notes, duration_override, target_temperature_celsius, stretch_fold_interval_minutes) VALUES
-((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Alexandra''s Simple Artisan Loaf (Adapted)' AND user_id IS NULL), 1, 1, 0.20, 100, 'Prepare your levain until active and bubbly.', 300, 25, NULL),
+((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Alexandra''s Simple Artisan Loaf (Adapted)' AND user_id IS NULL), 1, 1, 20, 100, 'Prepare your levain until active and bubbly.', 300, 25, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Alexandra''s Simple Artisan Loaf (Adapted)' AND user_id IS NULL), 2, 2, NULL, NULL, 'Combine main flour and most of the water. Mix until just combined and let rest.', 30, NULL, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Alexandra''s Simple Artisan Loaf (Adapted)' AND user_id IS NULL), 3, 3, NULL, NULL, 'Add levain, salt, and remaining water. Mix thoroughly.', 15, NULL, NULL),
 ((SELECT recipe_id FROM Recipe WHERE recipe_name = 'Alexandra''s Simple Artisan Loaf (Adapted)' AND user_id IS NULL), 5, 4, NULL, NULL, 'Perform 3-4 sets of stretch and folds.', 240, 24, 45),
