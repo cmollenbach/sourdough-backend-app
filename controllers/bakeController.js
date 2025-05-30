@@ -15,12 +15,18 @@ exports.startBake = async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    // Fetch recipe details and the first step, including its duration_override
     const recipeCheckQuery = `
-      SELECT r.recipe_id, r.recipe_name, rs.recipe_step_id AS first_recipe_step_id,
-             rs.step_id AS first_step_id, s_step.step_name AS first_step_name,
-             rs.step_order AS first_step_order, rs.duration_override AS first_step_duration,
-             rs.notes AS first_step_notes, rs.target_temperature_celsius AS first_step_temp,
-             rs.stretch_fold_interval_minutes AS first_stretch_fold_interval
+      SELECT r.recipe_id, r.recipe_name, 
+             rs.recipe_step_id AS "first_recipe_step_id",
+             rs.step_id AS "first_step_id", 
+             s_step.step_name AS "first_step_name",
+             rs.step_order AS "first_step_order", 
+             COALESCE(rs.duration_override, s_step.duration_minutes) AS "first_step_planned_duration", -- Prioritize override
+             rs.duration_override AS "first_step_actual_duration_override", -- Explicitly get the override
+             rs.notes AS "first_step_notes", 
+             rs.target_temperature_celsius AS "first_step_temp",
+             rs.stretch_fold_interval_minutes AS "first_stretch_fold_interval"
       FROM "Recipe" r
       LEFT JOIN "RecipeStep" rs ON r.recipe_id = rs.recipe_id AND rs.step_order = (
           SELECT MIN(inner_rs.step_order) 
@@ -43,25 +49,36 @@ exports.startBake = async (req, res) => {
 
     const bakeLogQuery = `INSERT INTO "UserBakeLog" (user_id, recipe_id, status) VALUES ($1, $2, 'active') RETURNING bake_log_id, bake_start_timestamp;`;
     const bakeLogResult = await client.query(bakeLogQuery, [dbUserId, recipeId]);
-    const { bake_log_id: newBakeLogIdFromLog, bake_start_timestamp: bakeStartTime } = bakeLogResult.rows[0]; // Renamed to avoid conflict
+    const { bake_log_id: newBakeLogIdFromLog, bake_start_timestamp: bakeStartTime } = bakeLogResult.rows[0];
 
-    const bakeStepLogQuery = `INSERT INTO "UserBakeStepLog" (bake_log_id, recipe_step_id, step_order, step_name, planned_duration_minutes, actual_start_timestamp) VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING bake_step_log_id, actual_start_timestamp;`;
-    const bakeStepLogResult = await client.query(bakeStepLogQuery, [newBakeLogIdFromLog, recipeDetails.first_recipe_step_id, recipeDetails.first_step_order, recipeDetails.first_step_name, recipeDetails.first_step_duration]);
+    const bakeStepLogQuery = `
+      INSERT INTO "UserBakeStepLog" (bake_log_id, recipe_step_id, step_order, step_name, planned_duration_minutes, actual_start_timestamp) 
+      VALUES ($1, $2, $3, $4, $5, NOW()) 
+      RETURNING bake_step_log_id, actual_start_timestamp;`;
+    const bakeStepLogResult = await client.query(bakeStepLogQuery, [
+        newBakeLogIdFromLog, 
+        recipeDetails.first_recipe_step_id, 
+        recipeDetails.first_step_order, 
+        recipeDetails.first_step_name, 
+        recipeDetails.first_step_planned_duration // This uses the COALESCE logic from above
+    ]);
     const { bake_step_log_id: newBakeStepLogId, actual_start_timestamp: firstStepStartTime } = bakeStepLogResult.rows[0];
 
     await client.query("COMMIT");
     console.log(`   Bake Log ID ${newBakeLogIdFromLog} started for recipe "${recipeDetails.recipe_name}". First step log ID ${newBakeStepLogId}`);
+    
     res.status(201).json({
       message: "Bake session started.",
-      bakeLogId: newBakeLogIdFromLog, // Use ID from UserBakeLog
-      currentBakeStepLogId: newBakeStepLogId, // Use ID from UserBakeStepLog
-      firstStepDetails: {
-        bake_step_log_id: newBakeStepLogId, // Add this for consistency
+      bakeLogId: newBakeLogIdFromLog,
+      currentBakeStepLogId: newBakeStepLogId, // Keep for legacy compatibility if any client part uses it
+      firstStepDetails: { // Renamed from currentStepDetails for clarity in startBake context
+        bake_step_log_id: newBakeStepLogId,
         recipe_step_id: recipeDetails.first_recipe_step_id,
         step_id: recipeDetails.first_step_id,
         step_name: recipeDetails.first_step_name,
         step_order: recipeDetails.first_step_order,
-        planned_duration_minutes: recipeDetails.first_step_duration,
+        planned_duration_minutes: recipeDetails.first_step_planned_duration, // Actual planned duration logged
+        duration_override: recipeDetails.first_step_actual_duration_override, // Explicit override value for frontend logic
         notes: recipeDetails.first_step_notes,
         target_temperature_celsius: recipeDetails.first_step_temp,
         actual_start_timestamp: firstStepStartTime,
@@ -69,6 +86,7 @@ exports.startBake = async (req, res) => {
       },
       bakeStartTimestamp: bakeStartTime,
       recipeName: recipeDetails.recipe_name,
+      status: 'active' // Explicitly return current status
     });
   } catch (error) {
     if (client) await client.query("ROLLBACK");
@@ -92,7 +110,11 @@ exports.completeBakeStep = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const bakeLogCheckQuery = `SELECT ubl.recipe_id, ubsl.step_order AS completed_step_order, ubl.status FROM "UserBakeLog" ubl JOIN "UserBakeStepLog" ubsl ON ubl.bake_log_id = ubsl.bake_log_id WHERE ubl.bake_log_id = $1 AND ubl.user_id = $2 AND ubsl.bake_step_log_id = $3;`;
+    const bakeLogCheckQuery = `
+        SELECT ubl.recipe_id, ubsl.step_order AS "completed_step_order", ubl.status 
+        FROM "UserBakeLog" ubl 
+        JOIN "UserBakeStepLog" ubsl ON ubl.bake_log_id = ubsl.bake_log_id 
+        WHERE ubl.bake_log_id = $1 AND ubl.user_id = $2 AND ubsl.bake_step_log_id = $3;`;
     const bakeLogCheckResult = await client.query(bakeLogCheckQuery, [bakeLogId, dbUserId, currentBakeStepLogId]);
 
     if (bakeLogCheckResult.rows.length === 0) {
@@ -111,24 +133,46 @@ exports.completeBakeStep = async (req, res) => {
     console.log(`   Step Log ID ${currentBakeStepLogId} marked complete.`);
 
     const nextStepQuery = `
-      SELECT rs.recipe_step_id, rs.step_id, s.step_name, rs.step_order, rs.duration_override AS planned_duration_minutes, 
-             rs.notes, s.description AS step_general_description, rs.target_temperature_celsius, rs.stretch_fold_interval_minutes
+      SELECT rs.recipe_step_id, rs.step_id, s.step_name, rs.step_order, 
+             COALESCE(rs.duration_override, s.duration_minutes) AS "planned_duration_minutes", -- Prioritize override
+             rs.duration_override, -- Explicitly get the override for frontend logic
+             rs.notes, s.description AS "step_general_description", 
+             rs.target_temperature_celsius, rs.stretch_fold_interval_minutes
       FROM "RecipeStep" rs JOIN "Step" s ON rs.step_id = s.step_id
       WHERE rs.recipe_id = $1 AND rs.step_order > $2 ORDER BY rs.step_order ASC LIMIT 1;`;
     const nextStepResult = await client.query(nextStepQuery, [recipe_id, completed_step_order]);
 
     if (nextStepResult.rows.length > 0) {
       const nextStepRecipeData = nextStepResult.rows[0];
-      const insertNextLogQuery = `INSERT INTO "UserBakeStepLog" (bake_log_id, recipe_step_id, step_order, step_name, planned_duration_minutes, actual_start_timestamp) VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING bake_step_log_id, actual_start_timestamp;`;
-      const nextLogResult = await client.query(insertNextLogQuery, [bakeLogId, nextStepRecipeData.recipe_step_id, nextStepRecipeData.step_order, nextStepRecipeData.step_name, nextStepRecipeData.planned_duration_minutes]);
+      const insertNextLogQuery = `
+        INSERT INTO "UserBakeStepLog" (bake_log_id, recipe_step_id, step_order, step_name, planned_duration_minutes, actual_start_timestamp) 
+        VALUES ($1, $2, $3, $4, $5, NOW()) 
+        RETURNING bake_step_log_id, actual_start_timestamp;`;
+      const nextLogResult = await client.query(insertNextLogQuery, [
+          bakeLogId, 
+          nextStepRecipeData.recipe_step_id, 
+          nextStepRecipeData.step_order, 
+          nextStepRecipeData.step_name, 
+          nextStepRecipeData.planned_duration_minutes // Uses COALESCE logic
+      ]);
       const { bake_step_log_id: newNextBakeStepLogId, actual_start_timestamp: nextStepStartTime } = nextLogResult.rows[0];
       
       await client.query("COMMIT");
       console.log(`   Next Step Log ID ${newNextBakeStepLogId} initiated.`);
       
+      // Construct the object for the frontend, ensuring 'duration_override' is present
       const newCurrentStepDataForFrontend = {
-        ...nextStepRecipeData,
         bake_step_log_id: newNextBakeStepLogId,
+        recipe_step_id: nextStepRecipeData.recipe_step_id,
+        step_id: nextStepRecipeData.step_id,
+        step_name: nextStepRecipeData.step_name,
+        step_order: nextStepRecipeData.step_order,
+        planned_duration_minutes: nextStepRecipeData.planned_duration_minutes, // Actual planned duration
+        duration_override: nextStepRecipeData.duration_override, // The specific override value
+        notes: nextStepRecipeData.notes,
+        description: nextStepRecipeData.step_general_description,
+        target_temperature_celsius: nextStepRecipeData.target_temperature_celsius,
+        stretch_fold_interval_minutes: nextStepRecipeData.stretch_fold_interval_minutes,
         actual_start_timestamp: nextStepStartTime,
         user_step_notes: null 
       };
@@ -136,7 +180,6 @@ exports.completeBakeStep = async (req, res) => {
       res.status(200).json({ 
           message: "Step completed, next initiated.",
           currentStepDetails: newCurrentStepDataForFrontend 
-          // furtherNextStepDetails: could be added here if logic exists to fetch it
       });
     } else {
       await client.query(`UPDATE "UserBakeLog" SET status = 'completed', bake_end_timestamp = NOW(), updated_at = NOW() WHERE bake_log_id = $1 AND user_id = $2;`, [bakeLogId, dbUserId]);
@@ -168,17 +211,21 @@ exports.updateBakeStatus = async (req, res) => {
     await client.query("BEGIN");
     let setClauses = ["status = $1", "updated_at = NOW()"];
     const queryParams = [status];
-    if (status === 'abandoned') {
-        setClauses.push("bake_end_timestamp = NOW()");
+    let paramIndex = 2; // Start after status
+
+    if (status === 'abandoned' || status === 'completed') { // Ensure completed also sets end timestamp
+        setClauses.push(`bake_end_timestamp = NOW()`);
     } else if (status === 'active' || status === 'paused') {
-        setClauses.push("bake_end_timestamp = NULL");
+        setClauses.push(`bake_end_timestamp = NULL`);
     }
+    
     queryParams.push(bakeLogId, dbUserId);
 
-    const updateQuery = `UPDATE "UserBakeLog" SET ${setClauses.join(', ')} WHERE bake_log_id = $${queryParams.length-1} AND user_id = $${queryParams.length} RETURNING status, bake_end_timestamp;`;
+    const updateQuery = `UPDATE "UserBakeLog" SET ${setClauses.join(', ')} WHERE bake_log_id = $${paramIndex++} AND user_id = $${paramIndex++} RETURNING status, bake_end_timestamp;`;
     const result = await client.query(updateQuery, queryParams);
+
     if (result.rowCount === 0) {
-      await client.query("ROLLBACK"); return res.status(404).json({ message: "Bake session not found or no change needed." });
+      await client.query("ROLLBACK"); return res.status(404).json({ message: "Bake session not found or not authorized to update." });
     }
     await client.query("COMMIT");
     console.log(`   Bake Log ID ${bakeLogId} status updated to ${result.rows[0].status}.`);
@@ -202,9 +249,11 @@ exports.getActiveBakes = async (req, res) => {
              (SELECT json_build_object(
                   'bake_step_log_id', ubsl.bake_step_log_id, 
                   'recipe_step_id', ubsl.recipe_step_id,
+                  'step_id', rs.step_id, 
                   'step_order', ubsl.step_order, 
                   'step_name', ubsl.step_name,
-                  'planned_duration_minutes', ubsl.planned_duration_minutes,
+                  'planned_duration_minutes', ubsl.planned_duration_minutes, -- From UserBakeStepLog
+                  'duration_override', rs.duration_override, -- From RecipeStep
                   'actual_start_timestamp', ubsl.actual_start_timestamp,
                   'notes', rs.notes, 
                   'description', s.description, 
@@ -213,7 +262,7 @@ exports.getActiveBakes = async (req, res) => {
               ) FROM "UserBakeStepLog" ubsl
                 JOIN "RecipeStep" rs ON ubsl.recipe_step_id = rs.recipe_step_id
                 JOIN "Step" s ON rs.step_id = s.step_id
-                WHERE ubsl.bake_log_id = ubl.bake_log_id AND ubsl.actual_end_timestamp IS NULL
+                WHERE ubsl.bake_log_id = ubl.bake_log_id AND ubsl.actual_end_timestamp IS NULL 
                 ORDER BY ubsl.step_order ASC LIMIT 1
              ) AS "currentStepDetails"
       FROM "UserBakeLog" ubl 
@@ -225,8 +274,90 @@ exports.getActiveBakes = async (req, res) => {
     
     console.log(`   Found ${rows.length} active bake(s) for User ID ${dbUserId}.`);
     res.status(200).json({ activeBakes: rows });
+
   } catch (error) {
     console.error(`🔴 Error GET /api/bakes/active for UserID ${dbUserId}:`, error.stack);
     res.status(500).json({ message: "Server error fetching active bakes." });
+  }
+};
+
+exports.getBakeLogDetailsById = async (req, res) => {
+  const dbUserId = req.user.userId;
+  const { bakeLogId } = req.params;
+
+  console.log(`GET /api/bakes/${bakeLogId} - User ID ${dbUserId} fetching details.`);
+  if (isNaN(parseInt(bakeLogId))) {
+    return res.status(400).json({ message: "Valid Bake Log ID is required." });
+  }
+
+  try {
+    const query = `
+      SELECT 
+        ubl.bake_log_id AS "bakeLogId", 
+        ubl.recipe_id, 
+        r.recipe_name AS "recipeName",
+        ubl.bake_start_timestamp AS "bakeStartTimestamp", 
+        ubl.status,
+        ubl.bake_end_timestamp AS "bakeEndTimestamp",
+        ubl.user_overall_notes AS "userOverallNotes",
+        (SELECT json_build_object(
+            'bake_step_log_id', ubsl.bake_step_log_id, 
+            'recipe_step_id', ubsl.recipe_step_id,
+            'step_id', rs.step_id,                            -- Added step_id from RecipeStep/Step
+            'step_order', ubsl.step_order, 
+            'step_name', ubsl.step_name,
+            'planned_duration_minutes', ubsl.planned_duration_minutes, -- Duration logged at step start
+            'duration_override', rs.duration_override,                 -- Explicit override from RecipeStep
+            'actual_start_timestamp', ubsl.actual_start_timestamp,
+            'user_step_notes', ubsl.user_step_notes,
+            'notes', rs.notes,                                       -- Original notes from RecipeStep
+            'description', s.description,                           -- General description from Step table
+            'target_temperature_celsius', rs.target_temperature_celsius,
+            'stretch_fold_interval_minutes', rs.stretch_fold_interval_minutes
+          ) 
+         FROM "UserBakeStepLog" ubsl
+         JOIN "RecipeStep" rs ON ubsl.recipe_step_id = rs.recipe_step_id
+         JOIN "Step" s ON rs.step_id = s.step_id
+         WHERE ubsl.bake_log_id = $1 AND ubsl.actual_end_timestamp IS NULL
+         ORDER BY ubsl.step_order ASC LIMIT 1
+        ) AS "currentStepDetails",
+        (SELECT json_agg(
+            json_build_object(
+              'bake_step_log_id', hist_ubsl.bake_step_log_id,
+              'recipe_step_id', hist_ubsl.recipe_step_id, -- Added for completeness
+              'step_name', hist_ubsl.step_name,
+              'step_order', hist_ubsl.step_order,
+              'planned_duration_minutes', hist_ubsl.planned_duration_minutes, -- Added
+              'actual_start_timestamp', hist_ubsl.actual_start_timestamp,
+              'actual_end_timestamp', hist_ubsl.actual_end_timestamp,
+              'user_step_notes', hist_ubsl.user_step_notes
+            ) ORDER BY hist_ubsl.step_order ASC
+          )
+         FROM "UserBakeStepLog" hist_ubsl
+         WHERE hist_ubsl.bake_log_id = $1
+        ) AS "historyStepDetails"
+      FROM "UserBakeLog" ubl
+      JOIN "Recipe" r ON ubl.recipe_id = r.recipe_id
+      WHERE ubl.bake_log_id = $1 AND ubl.user_id = $2;
+    `;
+    
+    const { rows } = await pool.query(query, [bakeLogId, dbUserId]);
+
+    if (rows.length === 0) {
+      console.log(`   Bake Log ID ${bakeLogId} not found for User ID ${dbUserId}.`);
+      return res.status(404).json({ message: "Bake log not found or not authorized." });
+    }
+
+    const bakeLogDetail = rows[0];
+    // Ensure currentStepDetails is null if no active step, not an object with null values
+    if (bakeLogDetail.currentStepDetails && bakeLogDetail.currentStepDetails.bake_step_log_id === null) {
+        bakeLogDetail.currentStepDetails = null;
+    }
+    console.log(`   Successfully fetched details for Bake Log ID ${bakeLogId}. Current step details:`, bakeLogDetail.currentStepDetails);
+    res.status(200).json(bakeLogDetail);
+
+  } catch (error) {
+    console.error(`🔴 Error GET /api/bakes/${bakeLogId} for UserID ${dbUserId}:`, error.stack);
+    res.status(500).json({ message: "Server error fetching bake log details." });
   }
 };
