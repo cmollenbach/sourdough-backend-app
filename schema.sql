@@ -243,9 +243,16 @@ INSERT INTO "Unit" (unit_name, unit_abbreviation) VALUES
 ON CONFLICT (unit_name) DO NOTHING;
 
 INSERT INTO "Ingredient" (ingredient_name, is_wet) VALUES
-('Bread Flour', FALSE), ('Whole Wheat Flour', FALSE), ('Rye Flour', FALSE), ('All-Purpose Flour', FALSE),
-('Water', TRUE), ('Salt', FALSE), ('Active Sourdough Starter', TRUE), -- Starter is wet overall
-('Olive Oil', TRUE), ('Semolina Flour', FALSE), ('Spelt Flour', FALSE), (' zéro-waste bread flour', FALSE)
+('Bread Flour', FALSE),
+('Whole Wheat Flour', FALSE),
+('Rye Flour', FALSE),
+('Spelt Flour', FALSE),
+('Semolina Flour', FALSE),
+('Einkorn Flour', FALSE),
+('Other Flour', FALSE), 
+('Water', TRUE),
+('Active Sourdough Starter', TRUE),
+('Olive Oil', TRUE)
 ON CONFLICT (ingredient_name) DO NOTHING;
 
 INSERT INTO "Step" (step_name, step_type, description, is_predefined, duration_minutes) VALUES
