@@ -1,111 +1,106 @@
 // controllers/bakeController.js
 const pool = require('../config/db');
+const { getFullRecipeDetails } = require('./recipeController');
 
 // POST /api/bakes/start - Initiates a new guided baking session
-exports.startBake = async (req, res) => {
-  const dbUserId = req.user.userId;
-  const { recipeId } = req.body;
+exports.startBake = async (req, res, next) => {
+    try {
+        const dbUserId = req.user.userId;
+        const { recipeId } = req.body;
 
-  console.log(`User ID ${dbUserId} starting bake for Recipe ID ${recipeId}`);
-  if (!recipeId || isNaN(parseInt(recipeId))) {
-    return res.status(400).json({ message: "Valid Recipe ID is required." });
-  }
+        // 1. Create a new bake log
+        const insertBakeLogResult = await pool.query(
+            `INSERT INTO "UserBakeLog" (user_id, recipe_id, status, bake_start_timestamp) VALUES ($1, $2, 'active', NOW()) RETURNING bake_log_id, bake_start_timestamp;`,
+            [dbUserId, recipeId]
+        );
+        const newBakeLogIdFromLog = insertBakeLogResult.rows[0].bake_log_id;
+        const bakeStartTime = insertBakeLogResult.rows[0].bake_start_timestamp;
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+        // 2. Get the first step for this recipe
+        const recipeQuery = `
+          SELECT r.recipe_id, r.recipe_name,
+                 first_step.recipe_step_id AS "first_recipe_step_id",
+                 first_step.step_id AS "first_step_id",
+                 s_step.step_name AS "first_step_name",
+                 s_step.is_advanced AS "first_step_is_advanced",
+                 first_step.step_order AS "first_step_order",
+                 COALESCE(first_step.duration_override, s_step.duration_minutes) AS "first_step_planned_duration",
+                 first_step.duration_override AS "first_step_actual_duration_override",
+                 first_step.notes AS "first_step_notes",
+                 s_step.description AS "first_step_general_description",
+                 first_step.target_temperature_celsius AS "first_step_temp",
+                 first_step.stretch_fold_interval_minutes AS "first_stretch_fold_interval",
+                 first_step.number_of_sf_sets AS "first_number_of_sf_sets", 
+                 (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
+                    SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight, i.is_advanced
+                    FROM "StageIngredient" si
+                    JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
+                    WHERE si.recipe_step_id = first_step.recipe_step_id
+                 ) AS si_agg
+                ) AS "first_stage_ingredients"
+          FROM "Recipe" r
+          LEFT JOIN "RecipeStep" first_step ON r.recipe_id = first_step.recipe_id AND first_step.step_order = (
+              SELECT MIN(inner_rs.step_order)
+              FROM "RecipeStep" inner_rs
+              WHERE inner_rs.recipe_id = r.recipe_id
+          )
+          LEFT JOIN "Step" s_step ON first_step.step_id = s_step.step_id
+          WHERE r.recipe_id = $1 AND (r.user_id = $2 OR r.is_base_recipe = TRUE OR r.user_id IS NULL);`;
 
-    // Query to get recipe details and the first step, including its stage ingredients
-    const recipeQuery = `
-      SELECT r.recipe_id, r.recipe_name,
-             first_step.recipe_step_id AS "first_recipe_step_id",
-             first_step.step_id AS "first_step_id",
-             s_step.step_name AS "first_step_name",
-             first_step.step_order AS "first_step_order",
-             COALESCE(first_step.duration_override, s_step.duration_minutes) AS "first_step_planned_duration",
-             first_step.duration_override AS "first_step_actual_duration_override",
-             first_step.notes AS "first_step_notes",
-             s_step.description AS "first_step_general_description",
-             first_step.target_temperature_celsius AS "first_step_temp",
-             first_step.stretch_fold_interval_minutes AS "first_stretch_fold_interval",
-             (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
-                SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight
-                FROM "StageIngredient" si
-                JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
-                WHERE si.recipe_step_id = first_step.recipe_step_id
-             ) AS si_agg
-            ) AS "first_stage_ingredients"
-      FROM "Recipe" r
-      LEFT JOIN "RecipeStep" first_step ON r.recipe_id = first_step.recipe_id AND first_step.step_order = (
-          SELECT MIN(inner_rs.step_order)
-          FROM "RecipeStep" inner_rs
-          WHERE inner_rs.recipe_id = r.recipe_id
-      )
-      LEFT JOIN "Step" s_step ON first_step.step_id = s_step.step_id
-      WHERE r.recipe_id = $1 AND (r.user_id = $2 OR r.is_base_recipe = TRUE OR r.user_id IS NULL);`;
-    const recipeResult = await client.query(recipeQuery, [recipeId, dbUserId]);
+        const recipeResult = await pool.query(recipeQuery, [recipeId, dbUserId]);
+        if (!recipeResult.rows.length) {
+            return res.status(404).json({ message: "Recipe not found or not accessible." });
+        }
+        const recipeDetails = recipeResult.rows[0];
 
-    if (recipeResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ message: "Recipe not found or not accessible." });
+        // 3. Create the first bake step log
+        const insertStepLogResult = await pool.query(
+            `INSERT INTO "UserBakeStepLog" (bake_log_id, recipe_step_id, step_order, step_name, planned_duration_minutes, actual_start_timestamp)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             RETURNING bake_step_log_id, actual_start_timestamp;`,
+            [
+                newBakeLogIdFromLog,
+                recipeDetails.first_recipe_step_id,
+                recipeDetails.first_step_order,
+                recipeDetails.first_step_name,
+                recipeDetails.first_step_planned_duration
+            ]
+        );
+        const newBakeStepLogId = insertStepLogResult.rows[0].bake_step_log_id;
+        const firstStepStartTime = insertStepLogResult.rows[0].actual_start_timestamp;
+
+        res.status(201).json({
+            message: "Bake session started.",
+            bakeLogId: newBakeLogIdFromLog,
+            currentBakeStepLogId: newBakeStepLogId,
+            firstStepDetails: {
+                bake_step_log_id: newBakeStepLogId,
+                recipe_step_id: recipeDetails.first_recipe_step_id,
+                step_id: recipeDetails.first_step_id,
+                step_name: recipeDetails.first_step_name,
+                step_order: recipeDetails.first_step_order,
+                planned_duration_minutes: recipeDetails.first_step_planned_duration,
+                duration_override: recipeDetails.first_step_actual_duration_override,
+                notes: recipeDetails.first_step_notes,
+                description: recipeDetails.first_step_general_description,
+                target_temperature_celsius: recipeDetails.first_step_temp,
+                stretch_fold_interval_minutes: recipeDetails.first_stretch_fold_interval,
+                number_of_sf_sets: recipeDetails.first_number_of_sf_sets,
+                is_advanced: recipeDetails.first_step_is_advanced, 
+                stageIngredients: (recipeDetails.first_stage_ingredients || []).map(si => ({
+                  ...si,
+                  is_advanced: si.is_advanced 
+                })),
+                actual_start_timestamp: firstStepStartTime,
+                user_step_notes: null
+            },
+            bakeStartTimestamp: bakeStartTime,
+            recipeName: recipeDetails.recipe_name,
+            status: 'active'
+        });
+    } catch (err) {
+        next(err);
     }
-    const recipeDetails = recipeResult.rows[0];
-    if (!recipeDetails.first_recipe_step_id) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Recipe has no steps." });
-    }
-
-    const bakeLogQuery = `INSERT INTO "UserBakeLog" (user_id, recipe_id, status, bake_start_timestamp) VALUES ($1, $2, 'active', NOW()) RETURNING bake_log_id, bake_start_timestamp;`;
-    const bakeLogResult = await client.query(bakeLogQuery, [dbUserId, recipeId]);
-    const { bake_log_id: newBakeLogIdFromLog, bake_start_timestamp: bakeStartTime } = bakeLogResult.rows[0];
-
-    const bakeStepLogQuery = `
-      INSERT INTO "UserBakeStepLog" (bake_log_id, recipe_step_id, step_order, step_name, planned_duration_minutes, actual_start_timestamp)
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      RETURNING bake_step_log_id, actual_start_timestamp;`;
-    const bakeStepLogResult = await client.query(bakeStepLogQuery, [
-        newBakeLogIdFromLog,
-        recipeDetails.first_recipe_step_id,
-        recipeDetails.first_step_order,
-        recipeDetails.first_step_name,
-        recipeDetails.first_step_planned_duration
-    ]);
-    const { bake_step_log_id: newBakeStepLogId, actual_start_timestamp: firstStepStartTime } = bakeStepLogResult.rows[0];
-
-    await client.query("COMMIT");
-    console.log(`   Bake Log ID ${newBakeLogIdFromLog} started for recipe "${recipeDetails.recipe_name}". First step log ID ${newBakeStepLogId}`);
-
-    res.status(201).json({
-      message: "Bake session started.",
-      bakeLogId: newBakeLogIdFromLog,
-      currentBakeStepLogId: newBakeStepLogId, // This refers to UserBakeStepLog ID
-      firstStepDetails: { // This is the RecipeStep definition plus live bake data
-        bake_step_log_id: newBakeStepLogId, // UserBakeStepLog ID
-        recipe_step_id: recipeDetails.first_recipe_step_id, // Original RecipeStep ID
-        step_id: recipeDetails.first_step_id,
-        step_name: recipeDetails.first_step_name,
-        step_order: recipeDetails.first_step_order,
-        planned_duration_minutes: recipeDetails.first_step_planned_duration,
-        duration_override: recipeDetails.first_step_actual_duration_override, // from RecipeStep
-        notes: recipeDetails.first_step_notes, // from RecipeStep
-        description: recipeDetails.first_step_general_description, // from Step
-        target_temperature_celsius: recipeDetails.first_step_temp, // from RecipeStep
-        stretch_fold_interval_minutes: recipeDetails.first_stretch_fold_interval, // from RecipeStep
-        stageIngredients: recipeDetails.first_stage_ingredients || [], // NEWLY ADDED
-        actual_start_timestamp: firstStepStartTime, // from UserBakeStepLog
-        user_step_notes: null // No notes yet for the first step
-      },
-      bakeStartTimestamp: bakeStartTime,
-      recipeName: recipeDetails.recipe_name,
-      status: 'active'
-    });
-  } catch (error) {
-    if (client) await client.query("ROLLBACK");
-    console.error(`閥 Error POST /api/bakes/start UserID ${dbUserId}, RecipeID ${recipeId}:`, error.stack);
-    res.status(500).json({ message: "Server error starting bake." });
-  } finally {
-    if (client) client.release();
-  }
 };
 
 exports.completeBakeStep = async (req, res) => {
@@ -145,15 +140,16 @@ exports.completeBakeStep = async (req, res) => {
 
     // Fetch next RecipeStep details, including its stage ingredients
     const nextStepQuery = `
-      SELECT rs.recipe_step_id, rs.step_id, s.step_name, rs.step_order,
+      SELECT rs.recipe_step_id, rs.step_id, s.step_name, s.is_advanced AS step_is_advanced, rs.step_order,
              COALESCE(rs.duration_override, s.duration_minutes) AS "planned_duration_minutes",
              rs.duration_override, rs.notes, s.description AS "step_general_description",
              rs.target_temperature_celsius, rs.stretch_fold_interval_minutes,
+             rs.number_of_sf_sets, 
              (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
-                SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight
-                FROM "StageIngredient" si
-                JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
-                WHERE si.recipe_step_id = rs.recipe_step_id
+                SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight, i.is_advanced
+FROM "StageIngredient" si
+JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
+WHERE si.recipe_step_id = rs.recipe_step_id
              ) AS si_agg
             ) AS "stageIngredients"
       FROM "RecipeStep" rs JOIN "Step" s ON rs.step_id = s.step_id
@@ -179,20 +175,25 @@ exports.completeBakeStep = async (req, res) => {
       console.log(`   Next UserBakeStepLog ID ${newNextBakeStepLogId} initiated.`);
 
       const newCurrentStepDataForFrontend = {
-        bake_step_log_id: newNextBakeStepLogId, // UserBakeStepLog ID
-        recipe_step_id: nextStepRecipeData.recipe_step_id, // Original RecipeStep ID
+        bake_step_log_id: newNextBakeStepLogId,
+        recipe_step_id: nextStepRecipeData.recipe_step_id,
         step_id: nextStepRecipeData.step_id,
         step_name: nextStepRecipeData.step_name,
         step_order: nextStepRecipeData.step_order,
         planned_duration_minutes: nextStepRecipeData.planned_duration_minutes,
         duration_override: nextStepRecipeData.duration_override,
-        notes: nextStepRecipeData.notes, // From RecipeStep
-        description: nextStepRecipeData.step_general_description, // From Step
+        notes: nextStepRecipeData.notes,
+        description: nextStepRecipeData.step_general_description,
         target_temperature_celsius: nextStepRecipeData.target_temperature_celsius,
         stretch_fold_interval_minutes: nextStepRecipeData.stretch_fold_interval_minutes,
-        stageIngredients: nextStepRecipeData.stageIngredients || [], // NEWLY ADDED
-        actual_start_timestamp: nextStepStartTime, // From UserBakeStepLog
-        user_step_notes: null // Fresh step, no notes yet
+        number_of_sf_sets: nextStepRecipeData.number_of_sf_sets,
+        is_advanced: nextStepRecipeData.step_is_advanced, 
+        stageIngredients: (nextStepRecipeData.stageIngredients || []).map(si => ({
+          ...si,
+          is_advanced: si.is_advanced 
+        })),
+        actual_start_timestamp: nextStepStartTime,
+        user_step_notes: null
       };
 
       res.status(200).json({
@@ -278,15 +279,18 @@ exports.getActiveBakes = async (req, res) => {
                   'actual_start_timestamp', ubsl.actual_start_timestamp,
                   'notes', rs.notes,
                   'description', s.description,
+                  'is_advanced', s.is_advanced, 
                   'target_temperature_celsius', rs.target_temperature_celsius,
                   'stretch_fold_interval_minutes', rs.stretch_fold_interval_minutes,
+                  'number_of_sf_sets', rs.number_of_sf_sets, 
                   'stageIngredients', (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
-                                        SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight
+                                        SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight, i.is_advanced
                                         FROM "StageIngredient" si
                                         JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
                                         WHERE si.recipe_step_id = rs.recipe_step_id
                                      ) AS si_agg
-                                    )
+                                    ),
+                  'timing_relation_type', rs.timing_relation_type 
               ) FROM "UserBakeStepLog" ubsl
                 JOIN "RecipeStep" rs ON ubsl.recipe_step_id = rs.recipe_step_id
                 JOIN "Step" s ON rs.step_id = s.step_id
@@ -321,108 +325,97 @@ exports.getActiveBakes = async (req, res) => {
   }
 };
 
-// getBakeLogDetailsById needs to ensure stageIngredients are included in currentStepDetails and historyStepDetails (if needed)
+exports.getBakeHistory = async (req, res) => {
+  const dbUserId = req.user.userId;
+  try {
+    const query = `
+      SELECT 
+        ubl.bake_log_id, ubl.recipe_id, r.recipe_name,
+        ubl.bake_start_timestamp, ubl.bake_end_timestamp,
+        ubl.status, ubl.user_overall_notes
+      FROM "UserBakeLog" ubl
+      JOIN "Recipe" r ON ubl.recipe_id = r.recipe_id
+      WHERE ubl.user_id = $1
+      ORDER BY ubl.bake_start_timestamp DESC
+    `;
+    const { rows } = await pool.query(query, [dbUserId]);
+    res.json({ bakes: rows });
+  } catch (error) {
+    console.error("Error fetching bake history:", error);
+    res.status(500).json({ message: "Server error fetching bake history." });
+  }
+};
+
+
 exports.getBakeLogDetailsById = async (req, res) => {
   const dbUserId = req.user.userId;
   const { bakeLogId } = req.params;
 
-  console.log(`GET /api/bakes/${bakeLogId} - User ID ${dbUserId} fetching details.`);
-  if (isNaN(parseInt(bakeLogId))) {
-    return res.status(400).json({ message: "Valid Bake Log ID is required." });
-  }
+  const query = `
+    SELECT 
+      ubl.bake_log_id, ubl.recipe_id, ubl.status, ubl.user_overall_notes, r.recipe_name,
+      (SELECT json_build_object(
+          'bake_step_log_id', ubsl.bake_step_log_id,
+          'recipe_step_id', ubsl.recipe_step_id,
+          'step_id', rs.step_id,
+          'step_order', ubsl.step_order,
+          'step_name', ubsl.step_name,
+          'planned_duration_minutes', ubsl.planned_duration_minutes,
+          'duration_override', rs.duration_override,
+          'actual_start_timestamp', ubsl.actual_start_timestamp,
+          'notes', rs.notes,
+          'description', s.description,
+          'is_advanced', s.is_advanced, 
+          'target_temperature_celsius', rs.target_temperature_celsius,
+          'stretch_fold_interval_minutes', rs.stretch_fold_interval_minutes,
+          'number_of_sf_sets', rs.number_of_sf_sets, 
+          'stageIngredients', (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
+                                SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight, i.is_advanced
+                                FROM "StageIngredient" si
+                                JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
+                                WHERE si.recipe_step_id = rs.recipe_step_id
+                             ) AS si_agg
+                            ),
+          'timing_relation_type', rs.timing_relation_type 
+      ) FROM "UserBakeStepLog" ubsl
+        JOIN "RecipeStep" rs ON ubsl.recipe_step_id = rs.recipe_step_id
+        JOIN "Step" s ON rs.step_id = s.step_id
+        WHERE ubsl.bake_log_id = ubl.bake_log_id AND ubsl.actual_end_timestamp IS NULL
+        ORDER BY ubsl.step_order ASC LIMIT 1
+      ) AS "currentStepDetails"
+    FROM "UserBakeLog" ubl
+    JOIN "Recipe" r ON ubl.recipe_id = r.recipe_id
+    WHERE ubl.bake_log_id = $1 AND ubl.user_id = $2
+    LIMIT 1;
+  `;
 
   try {
-    // This query is already quite comprehensive from your original file.
-    // I'll ensure stageIngredients are part of currentStepDetails.
-    // Adding them to historyStepDetails might be too much data unless specifically needed by frontend.
-    const query = `
-      SELECT
-        ubl.bake_log_id AS "bakeLogId",
-        ubl.recipe_id,
-        r.recipe_name AS "recipeName",
-        ubl.bake_start_timestamp AS "bakeStartTimestamp",
-        ubl.status,
-        ubl.bake_end_timestamp AS "bakeEndTimestamp",
-        ubl.user_overall_notes AS "userOverallNotes",
-        (SELECT json_build_object(
-            'bake_step_log_id', ubsl.bake_step_log_id,
-            'recipe_step_id', ubsl.recipe_step_id,
-            'step_id', rs.step_id,
-            'step_order', ubsl.step_order,
-            'step_name', ubsl.step_name,
-            'planned_duration_minutes', ubsl.planned_duration_minutes,
-            'duration_override', rs.duration_override,
-            'actual_start_timestamp', ubsl.actual_start_timestamp,
-            'user_step_notes', ubsl.user_step_notes,
-            'notes', rs.notes,
-            'description', s.description,
-            'target_temperature_celsius', rs.target_temperature_celsius,
-            'stretch_fold_interval_minutes', rs.stretch_fold_interval_minutes,
-            'stageIngredients', (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
-                                  SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight
-                                  FROM "StageIngredient" si
-                                  JOIN "Ingredient" i ON si.ingredient_id = i.ingredient_id
-                                  WHERE si.recipe_step_id = rs.recipe_step_id
-                               ) AS si_agg
-                              )
-          )
-         FROM "UserBakeStepLog" ubsl
-         JOIN "RecipeStep" rs ON ubsl.recipe_step_id = rs.recipe_step_id
-         JOIN "Step" s ON rs.step_id = s.step_id
-         WHERE ubsl.bake_log_id = $1 AND ubsl.actual_end_timestamp IS NULL
-         ORDER BY ubsl.step_order ASC LIMIT 1
-        ) AS "currentStepDetails",
-        (SELECT json_agg(
-            json_build_object(
-              'bake_step_log_id', hist_ubsl.bake_step_log_id,
-              'recipe_step_id', hist_ubsl.recipe_step_id,
-              'step_name', hist_ubsl.step_name,
-              'step_order', hist_ubsl.step_order,
-              'planned_duration_minutes', hist_ubsl.planned_duration_minutes,
-              'actual_start_timestamp', hist_ubsl.actual_start_timestamp,
-              'actual_end_timestamp', hist_ubsl.actual_end_timestamp,
-              'user_step_notes', hist_ubsl.user_step_notes
-              -- If stageIngredients are needed for historical steps, add a subquery here too
-            ) ORDER BY hist_ubsl.step_order ASC
-          )
-         FROM "UserBakeStepLog" hist_ubsl
-         WHERE hist_ubsl.bake_log_id = $1
-        ) AS "historyStepDetails"
-      FROM "UserBakeLog" ubl
-      JOIN "Recipe" r ON ubl.recipe_id = r.recipe_id
-      WHERE ubl.bake_log_id = $1 AND ubl.user_id = $2;
-    `;
-
     const { rows } = await pool.query(query, [bakeLogId, dbUserId]);
+    if (!rows.length) {
+      return res.status(404).json({ message: "Bake log not found." });
+    }
+    const row = rows[0];
 
-    if (rows.length === 0) {
-      console.log(`   Bake Log ID ${bakeLogId} not found for User ID ${dbUserId}.`);
-      return res.status(404).json({ message: "Bake log not found or not authorized." });
+    // Always attach the full recipe for frontend calculations
+    const client = await pool.connect();
+    try {
+      const fullRecipe = await getFullRecipeDetails(client, row.recipe_id, dbUserId);
+      row.recipe = fullRecipe;
+    } finally {
+      client.release();
     }
 
-    const bakeLogDetail = rows[0];
-    if (bakeLogDetail.currentStepDetails) {
-        if (bakeLogDetail.currentStepDetails.bake_step_log_id === null) {
-            bakeLogDetail.currentStepDetails = null;
-        } else {
-            bakeLogDetail.currentStepDetails.stageIngredients = bakeLogDetail.currentStepDetails.stageIngredients || [];
-        }
-    }
-    if (bakeLogDetail.historyStepDetails) {
-        bakeLogDetail.historyStepDetails = bakeLogDetail.historyStepDetails.map(step => ({
-            ...step
-            // Add stageIngredients here if needed for historical steps by joining/subquerying
-        }));
-    } else {
-        bakeLogDetail.historyStepDetails = [];
+    // If there is no current step, explicitly set currentStepDetails to null
+    if (!row.currentstepdetails && !row.currentStepDetails) {
+      row.currentStepDetails = null;
+    } else if (row.currentstepdetails) {
+      row.currentStepDetails = row.currentstepdetails;
+      delete row.currentstepdetails;
     }
 
-
-    console.log(`   Successfully fetched details for Bake Log ID ${bakeLogId}.`);
-    res.status(200).json(bakeLogDetail);
-
+    res.json(row);
   } catch (error) {
-    console.error(`閥 Error GET /api/bakes/${bakeLogId} for UserID ${dbUserId}:`, error.stack);
+    console.error("Error fetching bake log details:", error);
     res.status(500).json({ message: "Server error fetching bake log details." });
   }
 };

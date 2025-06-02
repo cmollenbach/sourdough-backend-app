@@ -1,7 +1,6 @@
 -- schema.sql
 
--- Clear any existing tables (optional, for a clean slate during development)
--- BE CAREFUL with these lines in production or if you want to preserve data!
+-- Drop tables for a clean slate (optional, for development only)
 DROP TABLE IF EXISTS "StageIngredient" CASCADE;
 DROP TABLE IF EXISTS "UserBakeStepLog" CASCADE;
 DROP TABLE IF EXISTS "UserBakeLog" CASCADE;
@@ -19,7 +18,7 @@ CREATE TABLE "User" (
     email TEXT UNIQUE,
     password_hash TEXT,
     google_id TEXT UNIQUE,
-    auth_provider TEXT NOT NULL, -- e.g., 'email', 'google'
+    auth_provider TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -53,6 +52,7 @@ CREATE TABLE "Ingredient" (
     ingredient_id SERIAL PRIMARY KEY,
     ingredient_name TEXT UNIQUE NOT NULL, -- e.g., 'Bread Flour', 'Water', 'Salt'
     is_wet BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE if the ingredient is primarily a liquid and contributes to hydration
+    is_advanced BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -63,6 +63,7 @@ COMMENT ON COLUMN "Ingredient".ingredient_name IS 'Name of the ingredient (e.g.,
 COMMENT ON COLUMN "Ingredient".is_wet IS 'TRUE if the ingredient is primarily a liquid and contributes to hydration (e.g., water, milk). FALSE for dry ingredients like flour, salt.';
 COMMENT ON COLUMN "Ingredient".created_at IS 'Timestamp of when the ingredient was created.';
 COMMENT ON COLUMN "Ingredient".updated_at IS 'Timestamp of the last update to the ingredient information.';
+COMMENT ON COLUMN "Ingredient".is_advanced IS 'TRUE if this ingredient is considered advanced and should be hidden in simplified view.';
 
 -- 4. Recipe Table
 CREATE TABLE "Recipe" (
@@ -100,9 +101,11 @@ CREATE TABLE "Step" (
     step_id SERIAL PRIMARY KEY,
     step_name TEXT UNIQUE NOT NULL,
     description TEXT,
-    step_type TEXT NOT NULL, -- e.g., 'Preferment', 'Mixing', 'Fermentation', 'Shaping', 'Baking', 'Component', 'Resting'
-    duration_minutes INTEGER, -- Default typical duration for this step type, can be overridden in RecipeStep
-    is_predefined BOOLEAN NOT NULL DEFAULT TRUE, -- All entries in this table are system-defined types
+    step_type TEXT NOT NULL CHECK (step_type IN ('preferment', 'main_mix', 'timing')),
+    step_subtype TEXT, -- Optional: for display, e.g., 'Levain', 'Poolish'
+    duration_minutes INTEGER,
+    is_predefined BOOLEAN NOT NULL DEFAULT TRUE,
+    is_advanced BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -111,11 +114,12 @@ COMMENT ON TABLE "Step" IS 'Defines types or categories of recipe steps (e.g., '
 COMMENT ON COLUMN "Step".step_id IS 'Unique identifier for the predefined step type.';
 COMMENT ON COLUMN "Step".step_name IS 'Name of the predefined step type (e.g., ''Mix Levain'', ''Bulk Fermentation'').';
 COMMENT ON COLUMN "Step".description IS 'Optional description of what this type of step generally entails.';
-COMMENT ON COLUMN "Step".step_type IS 'General category for the step, used for UI grouping or logic (e.g., ''Preferment'', ''Mixing'', ''Fermentation'').';
+COMMENT ON COLUMN "Step".step_type IS 'General category for the step, used for UI grouping or logic (e.g., ''preferment'', ''main_mix'', ''timing'').';
 COMMENT ON COLUMN "Step".duration_minutes IS 'Default typical duration for this type of step, in minutes. Can be overridden at the RecipeStep level.';
 COMMENT ON COLUMN "Step".is_predefined IS 'TRUE if this is a system-provided, globally available step definition.';
 COMMENT ON COLUMN "Step".created_at IS 'Timestamp of when the step definition was created.';
 COMMENT ON COLUMN "Step".updated_at IS 'Timestamp of the last update to the step definition.';
+COMMENT ON COLUMN "Step".is_advanced IS 'TRUE if this step type is considered advanced and should be hidden in simplified view.';
 
 -- 6. RecipeStep Table
 CREATE TABLE "RecipeStep" (
@@ -129,6 +133,10 @@ CREATE TABLE "RecipeStep" (
     duration_override INTEGER,
     target_temperature_celsius REAL,
     stretch_fold_interval_minutes INTEGER,
+    number_of_sf_sets INTEGER,
+    timing_relation_type TEXT NOT NULL DEFAULT 'after_previous_completes'
+        CHECK (timing_relation_type IN ('after_previous_completes', 'with_previous_start', 'manual_independent')),
+    is_advanced BOOLEAN,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_recipe_step_order UNIQUE (recipe_id, step_order)
@@ -145,18 +153,21 @@ COMMENT ON COLUMN "RecipeStep".notes IS 'User-added notes or specific instructio
 COMMENT ON COLUMN "RecipeStep".duration_override IS 'User-defined duration in minutes for this instance of the step, overriding the default from the "Step" table if provided.';
 COMMENT ON COLUMN "RecipeStep".target_temperature_celsius IS 'Target temperature (in Celsius) for the dough or environment during this step, if applicable.';
 COMMENT ON COLUMN "RecipeStep".stretch_fold_interval_minutes IS 'If this step involves stretch and folds, this defines the interval in minutes between sets.';
+COMMENT ON COLUMN "RecipeStep".number_of_sf_sets IS 'For a ''Bulk Fermentation with Stretch and Fold'' step type, this optionally specifies the exact number of stretch and fold sets to be performed. If NULL, the number of S&Fs might be inferred from duration and interval, or not applicable.';
 COMMENT ON COLUMN "RecipeStep".created_at IS 'Timestamp of when this recipe step instance was created.';
 COMMENT ON COLUMN "RecipeStep".updated_at IS 'Timestamp of the last update to this recipe step instance.';
+COMMENT ON COLUMN "RecipeStep".timing_relation_type IS 'Defines how this step''s start time relates to the previous step or overall recipe flow.';
 
 -- 7. StageIngredient Table
 CREATE TABLE "StageIngredient" (
     stage_ingredient_id SERIAL PRIMARY KEY,
     recipe_step_id INTEGER NOT NULL REFERENCES "RecipeStep"(recipe_step_id) ON DELETE CASCADE,
     ingredient_id INTEGER NOT NULL REFERENCES "Ingredient"(ingredient_id) ON DELETE RESTRICT,
-    percentage REAL, -- Renamed from bakers_percentage. Context-dependent.
+    percentage REAL,
     calculated_weight REAL,
-    is_wet BOOLEAN NOT NULL DEFAULT FALSE, -- Already present, ensure consistency with Ingredient.is_wet
-    split_percentage REAL, -- For ingredients split across multiple additions within the same stage. Usage needs careful consideration.
+    is_wet BOOLEAN NOT NULL DEFAULT FALSE,
+    split_percentage REAL,
+    is_advanced BOOLEAN,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_recipe_step_ingredient UNIQUE (recipe_step_id, ingredient_id)
@@ -166,16 +177,13 @@ COMMENT ON TABLE "StageIngredient" IS 'Details each ingredient used in a specifi
 COMMENT ON COLUMN "StageIngredient".stage_ingredient_id IS 'Unique identifier for this ingredient entry within a recipe step.';
 COMMENT ON COLUMN "StageIngredient".recipe_step_id IS 'Foreign key to the RecipeStep this ingredient belongs to.';
 COMMENT ON COLUMN "StageIngredient".ingredient_id IS 'Foreign key to the Ingredient table, identifying the specific ingredient.';
-COMMENT ON COLUMN "StageIngredient".percentage IS 'The proportion of this ingredient, stored as a real number (e.g., 70 for 70.0%, 2.5 for 2.5%).
-- If this ingredient is a FLOUR in a RecipeStep that defines a flour mass (e.g., for "Levain Build", "Poolish Build", or main flours in "Mix Final Dough"): This is its percentage relative to THAT SPECIFIC STAGE''s total flour (these flour percentages should sum to 100 for that stage).
-- If this ingredient is WATER in such a stage: This is its percentage relative to THAT STAGE''s total flour, used to achieve the stage''s target_hydration (defined in RecipeStep).
-- If this ingredient is SALT (typically in "Mix Final Dough"): This is its percentage relative to the FINAL RECIPE''s total flour (as per Recipe.target_salt_pct).
-- For other ADDITIVES (seeds, nuts, etc.): The percentage relative to an appropriate base (e.g., total flour of the step or recipe), application logic will determine context.';
+COMMENT ON COLUMN "StageIngredient".percentage IS 'The proportion of this ingredient, stored as a real number (e.g., 70 for 70.0%, 2.5 for 2.5%).';
 COMMENT ON COLUMN "StageIngredient".calculated_weight IS 'Actual weight of the ingredient, calculated by the application based on percentages and overall recipe parameters. Stored in the unit defined by Recipe.target_weight_unit_id (typically grams).';
 COMMENT ON COLUMN "StageIngredient".is_wet IS 'TRUE if the ingredient contributes significantly to the dough''s hydration (e.g., water, milk), FALSE otherwise (e.g., flour, salt, seeds). Should align with Ingredient.is_wet.';
 COMMENT ON COLUMN "StageIngredient".split_percentage IS 'Optional: If an ingredient is added in parts during the same step, this can denote the percentage of this specific addition. Its use requires careful implementation in the application logic.';
 COMMENT ON COLUMN "StageIngredient".created_at IS 'Timestamp of when this stage ingredient entry was created.';
 COMMENT ON COLUMN "StageIngredient".updated_at IS 'Timestamp of the last update to this stage ingredient entry.';
+COMMENT ON COLUMN "StageIngredient".is_advanced IS 'Optional override for whether this ingredient instance is advanced. If NULL, falls back to Ingredient.is_advanced.';
 
 -- 8. UserBakeLog Table
 CREATE TABLE "UserBakeLog" (
@@ -184,7 +192,7 @@ CREATE TABLE "UserBakeLog" (
     recipe_id INTEGER NOT NULL REFERENCES "Recipe"(recipe_id) ON DELETE CASCADE,
     bake_start_timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     bake_end_timestamp TIMESTAMPTZ,
-    status VARCHAR(50) NOT NULL DEFAULT 'active', -- e.g., 'active', 'paused', 'completed', 'abandoned'
+    status VARCHAR(50) NOT NULL DEFAULT 'active',
     user_overall_notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -235,42 +243,4 @@ CREATE INDEX idx_userbakesteplog_bakelog_order ON "UserBakeStepLog"(bake_log_id,
 CREATE INDEX idx_recipe_step_recipe_id ON "RecipeStep"(recipe_id);
 CREATE INDEX idx_stage_ingredient_recipe_step_id ON "StageIngredient"(recipe_step_id);
 
-
--- Pre-populate essential lookup data
-INSERT INTO "Unit" (unit_name, unit_abbreviation) VALUES
-('grams', 'g'), ('ounces', 'oz'), ('milliliters', 'ml'), ('liters', 'l'),
-('teaspoons', 'tsp'), ('tablespoons', 'tbsp')
-ON CONFLICT (unit_name) DO NOTHING;
-
-INSERT INTO "Ingredient" (ingredient_name, is_wet) VALUES
-('Bread Flour', FALSE),
-('Whole Wheat Flour', FALSE),
-('Rye Flour', FALSE),
-('Spelt Flour', FALSE),
-('Semolina Flour', FALSE),
-('Einkorn Flour', FALSE),
-('Other Flour', FALSE), 
-('Water', TRUE),
-('Active Sourdough Starter', TRUE),
-('Olive Oil', TRUE)
-ON CONFLICT (ingredient_name) DO NOTHING;
-
-INSERT INTO "Step" (step_name, step_type, description, is_predefined, duration_minutes) VALUES
-('Levain Build', 'Preferment', 'Build and ferment the levain (sourdough starter pre-ferment).', TRUE, 480), -- 8 hours
-('Autolyse', 'Mixing', 'Resting flour and water before adding other ingredients.', TRUE, 30),
-('Mix Final Dough', 'Mixing', 'Combine all ingredients for the final dough.', TRUE, 15),
-('Bulk Fermentation', 'Fermentation', 'First rise of the dough, often with folds.', TRUE, 240), -- 4 hours
-('Bulk Fermentation with Stretch and Fold', 'Fermentation', 'Main fermentation period with periodic stretch and folds.', TRUE, 240), -- 4 hours
-('Shaping', 'Shaping', 'Shape the dough into its final form.', TRUE, 15),
-('Proofing', 'Fermentation', 'Final rise of the shaped dough (can be at room temp or cold).', TRUE, 120), -- 2 hours room temp
-('Baking', 'Baking', 'Bake the bread.', TRUE, 45),
-('Poolish Build', 'Preferment', 'Prepare and ferment a poolish.', TRUE, 720), -- 12 hours
-('Biga Build', 'Preferment', 'Prepare and ferment a biga.', TRUE, 720), -- 12 hours
-('Soaker Prep', 'Component', 'Soak grains, seeds, or other additions.', TRUE, 240), -- 4 hours
-('Scald Prep', 'Component', 'Prepare a scald with flour/grains and hot liquid.', TRUE, 60),
-('Pre-shaping', 'Shaping', 'Initial shaping of the dough before a bench rest.', TRUE, 10),
-('Bench Rest', 'Resting', 'A short rest period, often after pre-shaping.', TRUE, 20),
-('Cooling', 'Baking', 'Cooling the baked bread before slicing.', TRUE, 120) -- 2 hours
-ON CONFLICT (step_name) DO NOTHING;
-
-SELECT 'Database schema updated and initial data populated!' AS status;
+-- End of schema.sql

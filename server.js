@@ -28,6 +28,7 @@ const authRoutes = require('./routes/authRoutes');
 const recipeRoutes = require('./routes/recipeRoutes');
 const bakeRoutes = require('./routes/bakeRoutes');
 const ingredientRoutes = require('./routes/ingredientRoutes'); // <<< ADD THIS LINE
+const genaiRoutes = require('./routes/genaiRoutes');
 
 // Environment variable checks (can be centralized in a config/environment.js if preferred)
 if (!process.env.DATABASE_URL) {
@@ -47,6 +48,10 @@ if (!process.env.JWT_SECRET) {
 } else {
   console.log("🟢 DOTENV: JWT_SECRET seems loaded from server.js perspective.");
 }
+if (!process.env.GEMINI_API_KEY) {
+  console.error("🔴 FATAL ERROR: GEMINI_API_KEY is not defined. Check .env file or Render dashboard.");
+  process.exit(1);
+}
 
 
 const app = express();
@@ -60,11 +65,18 @@ console.log(`CORS enabled for origin: ${clientOrigin}`);
 // Core Middleware
 app.use(express.json()); // Parse JSON request bodies
 
+// Cache-Control Middleware for /api routes
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
 // === MOUNT ROUTES ===
 app.use('/auth', authRoutes);
 app.use('/api/recipes', recipeRoutes);
 app.use('/api/bakes', bakeRoutes);
 app.use('/api/ingredients', ingredientRoutes); // <<< ADD THIS LINE to mount the new ingredient routes
+app.use('/api/genai', genaiRoutes);
 
 // Simple root route
 app.get('/', (req, res) => {

@@ -52,6 +52,14 @@ exports.createRecipe = async (req, res) => {
     const newRecipe = recipeResult.rows[0];
     const recipeId = newRecipe.recipe_id;
 
+    // Validate step types
+    const allowedStepTypes = ['preferment', 'main_mix', 'timing'];
+    for (const step of steps) {
+      if (!allowedStepTypes.includes(step.step_type)) {
+        return res.status(400).json({ message: `Invalid step_type: ${step.step_type}. Allowed: ${allowedStepTypes.join(', ')}` });
+      }
+    }
+
     for (const step of steps) {
       if (step.step_id == null || step.step_order == null) {
         throw new Error("Each step must have a step_id and step_order.");
@@ -61,17 +69,26 @@ exports.createRecipe = async (req, res) => {
       // This validation can be more complex and might be better handled by a dedicated validation function.
 
       const recipeStepQuery = `
-        INSERT INTO "RecipeStep" (recipe_id, step_id, step_order, duration_override, notes, target_temperature_celsius, contribution_pct, target_hydration, stretch_fold_interval_minutes, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW()) RETURNING recipe_step_id;
+        INSERT INTO "RecipeStep" (
+          recipe_id, step_id, step_order, duration_override, notes, target_temperature_celsius,
+          contribution_pct, target_hydration, stretch_fold_interval_minutes, number_of_sf_sets,
+          timing_relation_type, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+        RETURNING recipe_step_id;
       `;
       const recipeStepValues = [
-        recipeId, step.step_id, step.step_order,
+        recipeId,
+        step.step_id,
+        step.step_order,
         step.duration_override != null ? parseInt(step.duration_override, 10) : null,
         step.notes || null,
         step.target_temperature_celsius != null ? parseFloat(step.target_temperature_celsius) : null,
-        step.contribution_pct != null ? parseFloat(step.contribution_pct) : null, // e.g., 20 for 20%
-        step.target_hydration != null ? parseFloat(step.target_hydration) : null, // e.g., 100 for 100%
+        step.contribution_pct != null ? parseFloat(step.contribution_pct) : null,
+        step.target_hydration != null ? parseFloat(step.target_hydration) : null,
         step.stretch_fold_interval_minutes != null ? parseInt(step.stretch_fold_interval_minutes, 10) : null,
+        step.number_of_sf_sets != null ? parseInt(step.number_of_sf_sets, 10) : null,
+        step.timingRelationType || 'after_previous_completes' // <-- Accept from frontend, fallback to default
       ];
       const recipeStepResult = await client.query(recipeStepQuery, recipeStepValues);
       const newRecipeStepId = recipeStepResult.rows[0].recipe_step_id;
@@ -181,11 +198,23 @@ exports.updateRecipe = async (req, res) => {
       await client.query('DELETE FROM "RecipeStep" WHERE recipe_id = $1', [recipeId]);
       console.log(`   Old RecipeSteps and StageIngredients deleted for recipe ID: ${recipeId}`);
 
+      // Validate step types
+      const allowedStepTypes = ['preferment', 'main_mix', 'timing'];
+      for (const step of steps) {
+        if (!allowedStepTypes.includes(step.step_type)) {
+          return res.status(400).json({ message: `Invalid step_type: ${step.step_type}. Allowed: ${allowedStepTypes.join(', ')}` });
+        }
+      }
+
       for (const step of steps) {
         if (step.step_id == null || step.step_order == null) throw new Error("Each step must have step_id and step_order.");
         const recipeStepQuery = `
-          INSERT INTO "RecipeStep" (recipe_id, step_id, step_order, duration_override, notes, target_temperature_celsius, contribution_pct, target_hydration, stretch_fold_interval_minutes, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW()) RETURNING recipe_step_id;
+          INSERT INTO "RecipeStep" (
+            recipe_id, step_id, step_order, duration_override, notes, target_temperature_celsius,
+            contribution_pct, target_hydration, stretch_fold_interval_minutes, number_of_sf_sets,
+            timing_relation_type, created_at, updated_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW()) RETURNING recipe_step_id;
         `;
         const recipeStepValues = [
             recipeId, step.step_id, step.step_order,
@@ -195,6 +224,8 @@ exports.updateRecipe = async (req, res) => {
             step.contribution_pct != null ? parseFloat(step.contribution_pct) : null,
             step.target_hydration != null ? parseFloat(step.target_hydration) : null,
             step.stretch_fold_interval_minutes != null ? parseInt(step.stretch_fold_interval_minutes, 10) : null,
+            step.number_of_sf_sets != null ? parseInt(step.number_of_sf_sets, 10) : null,
+            step.timingRelationType || 'after_previous_completes'
         ];
         const recipeStepResult = await client.query(recipeStepQuery, recipeStepValues);
         const newRecipeStepId = recipeStepResult.rows[0].recipe_step_id;
@@ -251,7 +282,8 @@ async function getFullRecipeDetails(client, recipeId, userIdForPermissionCheck) 
                         s.duration_minutes AS step_default_duration_minutes, rs.step_order,
                         rs.duration_override, rs.notes, rs.target_temperature_celsius,
                         rs.contribution_pct, rs.target_hydration,
-                        rs.stretch_fold_interval_minutes,
+                        rs.stretch_fold_interval_minutes, rs.number_of_sf_sets,
+                        rs.timing_relation_type,
                         (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
                             SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight
                             FROM "StageIngredient" si
@@ -262,6 +294,7 @@ async function getFullRecipeDetails(client, recipeId, userIdForPermissionCheck) 
                  FROM "RecipeStep" rs
                  JOIN "Step" s ON rs.step_id = s.step_id
                  WHERE rs.recipe_id = r.recipe_id
+                 ORDER BY rs.step_order ASC
              ) AS rs_agg
             ) AS steps
       FROM "Recipe" r
@@ -290,7 +323,8 @@ async function getFullRecipeDetails(client, recipeId, userIdForPermissionCheck) 
     if (recipe.steps) {
       recipe.steps = recipe.steps.map(step => ({
         ...step,
-        stageIngredients: step.stageIngredients || [] // Ensure stageIngredients is always an array
+        timingRelationType: step.timing_relation_type || 'after_previous_completes',
+        stageIngredients: step.stageIngredients || []
       }));
     } else {
       recipe.steps = [];
@@ -322,6 +356,7 @@ exports.getRecipeTemplates = async (req, res) => {
                       ) AS "stageIngredients"
                 FROM "RecipeStep" rs JOIN "Step" s ON rs.step_id = s.step_id
                 WHERE rs.recipe_id = r.recipe_id
+                ORDER BY rs.step_order ASC
              ) AS rs_agg
             ) AS steps
       FROM "Recipe" r
@@ -369,7 +404,8 @@ exports.getAllUserRecipes = async (req, res) => {
                         s.duration_minutes AS step_default_duration_minutes, rs.step_order,
                         rs.duration_override, rs.notes, rs.target_temperature_celsius,
                         rs.contribution_pct, rs.target_hydration,
-                        rs.stretch_fold_interval_minutes,
+                        rs.stretch_fold_interval_minutes, rs.number_of_sf_sets,
+                        rs.timing_relation_type,
                         (SELECT json_agg(si_agg.* ORDER BY si_agg.stage_ingredient_id ASC) FROM (
                             SELECT si.stage_ingredient_id, si.ingredient_id, i.ingredient_name, si.percentage, si.is_wet, si.calculated_weight
                             FROM "StageIngredient" si
@@ -380,6 +416,7 @@ exports.getAllUserRecipes = async (req, res) => {
                  FROM "RecipeStep" rs
                  JOIN "Step" s ON rs.step_id = s.step_id
                  WHERE rs.recipe_id = r.recipe_id
+                 ORDER BY rs.step_order ASC
              ) AS rs_agg
             ) AS steps
       FROM "Recipe" r WHERE r.user_id = $1 ORDER BY r.created_at DESC;`;
@@ -492,3 +529,5 @@ exports.deleteRecipe = async (req, res) => {
     if (client) client.release();
   }
 };
+
+module.exports.getFullRecipeDetails = getFullRecipeDetails;
